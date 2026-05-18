@@ -51,16 +51,104 @@ jobs:
           ARCHIVE="${BIN}-${{ matrix.target }}.tar.gz"
           tar -C "target/${{ matrix.target }}/release" -czf "dist/${ARCHIVE}" "${BIN}"
           shasum -a 256 "dist/${ARCHIVE}" | awk '{print $1}' > "dist/${ARCHIVE}.sha256"
-          echo "ARCHIVE_PATH=dist/${ARCHIVE}" >> $GITHUB_ENV
 
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target }}
           path: dist/*
 
+  build-app:
+    name: Build Spellbook.app + .dmg
+    needs: build
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Lipo universal binary
+        run: |
+          set -e
+          mkdir build
+          tar -xzf artifacts/aarch64-apple-darwin/spellbook-aarch64-apple-darwin.tar.gz -C build
+          mv build/spellbook build/spellbook-arm
+          tar -xzf artifacts/x86_64-apple-darwin/spellbook-x86_64-apple-darwin.tar.gz -C build
+          mv build/spellbook build/spellbook-intel
+          lipo -create -output build/spellbook-universal \
+            build/spellbook-arm build/spellbook-intel
+          file build/spellbook-universal
+
+      - name: Assemble Spellbook.app
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -e
+          VERSION="${TAG#v}"
+          APP=Spellbook.app
+          rm -rf "$APP"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          cp build/spellbook-universal "$APP/Contents/MacOS/spellbook"
+          chmod +x "$APP/Contents/MacOS/spellbook"
+
+          ICONSET=Spellbook.iconset
+          rm -rf "$ICONSET" && mkdir "$ICONSET"
+          for spec in 16:16x16 32:16x16@2x 32:32x32 64:32x32@2x \
+                      128:128x128 256:128x128@2x 256:256x256 512:256x256@2x \
+                      512:512x512 1024:512x512@2x; do
+            size=${spec%%:*}; name=${spec#*:}
+            sips -Z "$size" assets/icon-source.png --out "$ICONSET/icon_${name}.png" > /dev/null
+          done
+          iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns"
+          rm -rf "$ICONSET"
+
+          cat > "$APP/Contents/Info.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key>                <string>Spellbook</string>
+            <key>CFBundleDisplayName</key>         <string>Spellbook</string>
+            <key>CFBundleIdentifier</key>          <string>io.github.bkcarlos.spellbook</string>
+            <key>CFBundleVersion</key>             <string>${VERSION}</string>
+            <key>CFBundleShortVersionString</key>  <string>${VERSION}</string>
+            <key>CFBundleExecutable</key>          <string>spellbook</string>
+            <key>CFBundleIconFile</key>            <string>AppIcon</string>
+            <key>CFBundlePackageType</key>         <string>APPL</string>
+            <key>CFBundleSignature</key>           <string>????</string>
+            <key>LSMinimumSystemVersion</key>      <string>10.15</string>
+            <key>NSHighResolutionCapable</key>     <true/>
+            <key>NSSupportsAutomaticGraphicsSwitching</key> <true/>
+            <key>LSApplicationCategoryType</key>   <string>public.app-category.developer-tools</string>
+          </dict>
+          </plist>
+          PLIST
+          touch "$APP"
+          ls -la "$APP/Contents"
+
+      - name: Make .dmg
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -e
+          VERSION="${TAG#v}"
+          DMG="Spellbook-${VERSION}.dmg"
+          hdiutil create -volname "Spellbook" \
+            -srcfolder Spellbook.app -ov -format UDZO "$DMG"
+          shasum -a 256 "$DMG" | awk '{print $1}' > "$DMG.sha256"
+          mkdir -p dist
+          mv "$DMG" "$DMG.sha256" dist/
+          ls -lh dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-app
+          path: dist/*
+
   release:
     name: Publish release
-    needs: build
+    needs: [build, build-app]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -71,25 +159,9 @@ jobs:
       - name: Flatten artifacts
         run: |
           mkdir -p release
-          find artifacts -type f \( -name '*.tar.gz' -o -name '*.sha256' \) \
+          find artifacts -type f \( -name '*.tar.gz' -o -name '*.sha256' -o -name '*.dmg' \) \
             -exec cp {} release/ \;
           ls -lh release/
-
-      - name: Print Homebrew formula stanza
-        run: |
-          set -e
-          echo "Copy this into Formula/spellbook.rb in your tap:"
-          echo
-          ARM_SHA=$(cat release/spellbook-aarch64-apple-darwin.tar.gz.sha256)
-          INTEL_SHA=$(cat release/spellbook-x86_64-apple-darwin.tar.gz.sha256)
-          LINUX_SHA=$(cat release/spellbook-x86_64-unknown-linux-gnu.tar.gz.sha256)
-          VERSION="${GITHUB_REF_NAME#v}"
-          cat <<EOF
-          version "${VERSION}"
-          arm SHA:    ${ARM_SHA}
-          intel SHA:  ${INTEL_SHA}
-          linux SHA:  ${LINUX_SHA}
-          EOF
 
       - uses: softprops/action-gh-release@v2
         with:
@@ -98,10 +170,11 @@ jobs:
           files: |
             release/*.tar.gz
             release/*.sha256
+            release/*.dmg
 
   publish-tap:
-    name: Push formula to Homebrew tap
-    needs: [build, release]
+    name: Push formula + cask to Homebrew tap
+    needs: [build, build-app, release]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -110,8 +183,7 @@ jobs:
         with:
           path: artifacts
 
-      - name: Render formula from template
-        id: render
+      - name: Render formula + cask
         env:
           TAG: ${{ github.ref_name }}
         run: |
@@ -120,32 +192,58 @@ jobs:
           ARM=$(cat artifacts/aarch64-apple-darwin/spellbook-aarch64-apple-darwin.tar.gz.sha256)
           INTEL=$(cat artifacts/x86_64-apple-darwin/spellbook-x86_64-apple-darwin.tar.gz.sha256)
           LINUX=$(cat artifacts/x86_64-unknown-linux-gnu/spellbook-x86_64-unknown-linux-gnu.tar.gz.sha256)
-          mkdir -p rendered/Formula
+          DMG=$(cat artifacts/macos-app/Spellbook-${VER}.dmg.sha256)
+
+          mkdir -p rendered/Formula rendered/Casks
+
+          # ── Formula (binary install via `brew install spellbook`)
           sed \
             -e "s|^  version \"[^\"]*\"|  version \"${VER}\"|" \
             -e "s|REPLACE_WITH_ARM64_MAC_SHA256|${ARM}|" \
             -e "s|REPLACE_WITH_INTEL_MAC_SHA256|${INTEL}|" \
             -e "s|REPLACE_WITH_LINUX_X86_64_SHA256|${LINUX}|" \
             Formula/spellbook.rb > rendered/Formula/spellbook.rb
-          # Re-substitute any prior real SHAs in case the template was
-          # accidentally committed with patched values (idempotent).
-          python3 - <<PYEOF
-          import re
-          path = "rendered/Formula/spellbook.rb"
-          shas = { "aarch64-apple-darwin": "${ARM}",
-                   "x86_64-apple-darwin":  "${INTEL}",
-                   "x86_64-unknown-linux-gnu": "${LINUX}" }
-          src = open(path).read()
+
+          # ── Cask (.app install via `brew install --cask spellbook`)
+          sed \
+            -e "s|^  version \"[^\"]*\"|  version \"${VER}\"|" \
+            -e "s|REPLACE_WITH_DMG_SHA256|${DMG}|" \
+            Casks/spellbook.rb > rendered/Casks/spellbook.rb
+
+          # Idempotent re-substitution: if templates already had real SHAs
+          # (e.g. snapshot committed by hand), update them to current values.
+          ARM="$ARM" INTEL="$INTEL" LINUX="$LINUX" DMG="$DMG" python3 - <<'PYEOF'
+          import os, re
+          f_path = "rendered/Formula/spellbook.rb"
+          c_path = "rendered/Casks/spellbook.rb"
+          shas = {
+              "aarch64-apple-darwin":      os.environ["ARM"],
+              "x86_64-apple-darwin":       os.environ["INTEL"],
+              "x86_64-unknown-linux-gnu":  os.environ["LINUX"],
+          }
+          src = open(f_path).read()
           for target, sha in shas.items():
-              # find sha256 line within 4 lines after the URL for this target
               pat = re.compile(
                   r'(url\s+"[^"]*' + re.escape(target) + r'[^"]*"\s*\n\s*sha256\s+)"[^"]*"'
               )
               src = pat.sub(lambda m: f'{m.group(1)}"{sha}"', src)
-          open(path, "w").write(src)
+          open(f_path, "w").write(src)
+
+          src = open(c_path).read()
+          # cask has version + sha256 + url(refers v#{version})
+          src = re.sub(
+              r'(\n\s*sha256\s+)"[0-9a-f]{64}"',
+              lambda m: f'{m.group(1)}"{os.environ["DMG"]}"',
+              src, count=1,
+          )
+          open(c_path, "w").write(src)
           PYEOF
+
           echo "::group::Rendered formula"
           cat rendered/Formula/spellbook.rb
+          echo "::endgroup::"
+          echo "::group::Rendered cask"
+          cat rendered/Casks/spellbook.rb
           echo "::endgroup::"
 
       - name: Check TAP_TOKEN
@@ -155,8 +253,6 @@ jobs:
         run: |
           if [ -z "$TOKEN" ]; then
             echo "TAP_TOKEN secret not set — skipping tap push."
-            echo "  Add a Personal Access Token with 'contents: write' on"
-            echo "  bkcarlos/homebrew-spellbook as repo secret 'TAP_TOKEN'."
             echo "ok=false" >> $GITHUB_OUTPUT
           else
             echo "ok=true" >> $GITHUB_OUTPUT
@@ -171,17 +267,19 @@ jobs:
           set -e
           git clone "https://x-access-token:${TOKEN}@github.com/bkcarlos/homebrew-spellbook.git" tap
           cd tap
-          mkdir -p Formula
+          mkdir -p Formula Casks
           cp ../rendered/Formula/spellbook.rb Formula/spellbook.rb
+          cp ../rendered/Casks/spellbook.rb   Casks/spellbook.rb
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add Formula/spellbook.rb
+          git add Formula/spellbook.rb Casks/spellbook.rb
           if git diff --staged --quiet; then
-            echo "no changes to formula"
+            echo "no changes to publish"
             exit 0
           fi
           BRANCH=$(git branch --show-current)
           [ -z "$BRANCH" ] && BRANCH=master
           git commit -m "Bump spellbook to ${TAG}"
           git push -u origin "$BRANCH"
-          echo "  formula pushed: brew tap bkcarlos/spellbook && brew install spellbook"
+          echo "  pushed: brew install spellbook  (CLI)"
+          echo "          brew install --cask spellbook  (GUI .app)"

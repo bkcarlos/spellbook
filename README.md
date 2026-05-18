@@ -22,9 +22,19 @@ A small, fast desktop app (Rust + egui) for anyone who lives in a terminal — d
 
 ### macOS (Homebrew)
 
+Two ways, pick one:
+
 ```bash
+# CLI binary — adds `spellbook` to PATH, run from a terminal
 brew tap bkcarlos/spellbook
 brew install spellbook
+spellbook
+
+# .app bundle — installs Spellbook.app to /Applications, Dock-friendly,
+# Spotlight-searchable, Launchpad icon
+brew tap bkcarlos/spellbook
+brew install --cask spellbook
+open -a Spellbook
 ```
 
 Then run `spellbook` from a terminal.

@@ -14,10 +14,22 @@ git push origin main --tags
 
 Within ~10 minutes:
 
-- ✅ macOS arm64, macOS x86_64, Linux x86_64 binaries built
-- ✅ GitHub Release published with all 3 archives (not draft)
-- ✅ Homebrew formula auto-bumped + pushed to `bkcarlos/homebrew-spellbook`
-- ✅ Users can `brew upgrade spellbook`
+- ✅ macOS arm64, macOS x86_64, Linux x86_64 CLI binaries built
+- ✅ Universal `Spellbook.app` assembled + wrapped in `Spellbook-X.Y.Z.dmg`
+- ✅ GitHub Release published with all archives (3 .tar.gz + 1 .dmg)
+- ✅ Homebrew **formula** auto-bumped (CLI binary install)
+- ✅ Homebrew **cask** auto-bumped (drag-to-Applications .app install)
+- ✅ Users can `brew upgrade spellbook` or `brew upgrade --cask spellbook`
+
+## Install paths users can take
+
+```bash
+brew install spellbook              # CLI: binary in /opt/homebrew/bin/
+brew install --cask spellbook       # GUI: Spellbook.app in /Applications/
+```
+
+Both reach the same v0.1.0 binary internally; the cask just wraps it in a
+proper .app bundle so it shows in Dock / Spotlight / Launchpad.
 
 ## One-time setup (already done if you're reading this)
 

@@ -1,0 +1,92 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" shape-rendering="geometricPrecision">
+  <!-- ============================================================
+       Spellbook v1 app icon
+       - Deep violet rounded-square (macOS app shape)
+       - Open book in cream/parchment
+       - 4-point gold sparkle above
+       ============================================================ -->
+
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%"  stop-color="#3d2e58"/>
+      <stop offset="100%" stop-color="#241a36"/>
+    </linearGradient>
+    <linearGradient id="page" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%"  stop-color="#f5e9cf"/>
+      <stop offset="100%" stop-color="#e6d6b2"/>
+    </linearGradient>
+    <linearGradient id="spine" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%"  stop-color="#5a4630"/>
+      <stop offset="100%" stop-color="#3d2e1e"/>
+    </linearGradient>
+    <radialGradient id="sparkle" cx="50%" cy="50%" r="50%">
+      <stop offset="0%"  stop-color="#fff4c2"/>
+      <stop offset="60%" stop-color="#f7c948"/>
+      <stop offset="100%" stop-color="#d99c1c"/>
+    </radialGradient>
+  </defs>
+
+  <!-- App-icon rounded-square background -->
+  <rect x="0" y="0" width="1024" height="1024" rx="224" fill="url(#bg)"/>
+
+  <!-- Soft glow under the sparkle (gives it presence) -->
+  <ellipse cx="512" cy="280" rx="220" ry="60" fill="#f7c948" opacity="0.10"/>
+
+  <!-- Open book: left page -->
+  <path d="
+    M 180 480
+    L 504 432
+    L 504 832
+    L 200 808
+    Q 178 805 178 782
+    L 178 500
+    Q 178 482 180 480 Z
+  " fill="url(#page)" stroke="#a08e6a" stroke-width="6" stroke-linejoin="round"/>
+
+  <!-- Open book: right page (mirror) -->
+  <path d="
+    M 844 480
+    L 520 432
+    L 520 832
+    L 824 808
+    Q 846 805 846 782
+    L 846 500
+    Q 846 482 844 480 Z
+  " fill="url(#page)" stroke="#a08e6a" stroke-width="6" stroke-linejoin="round"/>
+
+  <!-- Spine shadow between the two pages -->
+  <path d="M 504 432 L 520 432 L 520 832 L 504 832 Z" fill="url(#spine)"/>
+
+  <!-- Left-page lines (suggest text) -->
+  <line x1="232" y1="540" x2="476" y2="510" stroke="#9b8a64" stroke-width="10" stroke-linecap="round"/>
+  <line x1="232" y1="600" x2="476" y2="570" stroke="#9b8a64" stroke-width="10" stroke-linecap="round"/>
+  <line x1="232" y1="660" x2="412" y2="640" stroke="#9b8a64" stroke-width="10" stroke-linecap="round"/>
+  <line x1="232" y1="720" x2="476" y2="700" stroke="#9b8a64" stroke-width="10" stroke-linecap="round"/>
+
+  <!-- Right-page lines -->
+  <line x1="548" y1="510" x2="792" y2="540" stroke="#9b8a64" stroke-width="10" stroke-linecap="round"/>
+  <line x1="548" y1="570" x2="792" y2="600" stroke="#9b8a64" stroke-width="10" stroke-linecap="round"/>
+  <line x1="548" y1="640" x2="728" y2="660" stroke="#9b8a64" stroke-width="10" stroke-linecap="round"/>
+  <line x1="548" y1="700" x2="792" y2="720" stroke="#9b8a64" stroke-width="10" stroke-linecap="round"/>
+
+  <!-- 4-point sparkle (the "spell") -->
+  <g transform="translate(512 264)">
+    <!-- main star -->
+    <path d="
+      M 0 -132
+      C 12 -42, 42 -12, 132 0
+      C 42 12, 12 42, 0 132
+      C -12 42, -42 12, -132 0
+      C -42 -12, -12 -42, 0 -132 Z
+    " fill="url(#sparkle)"/>
+    <!-- inner brightness -->
+    <circle r="22" fill="#fffbe6" opacity="0.9"/>
+  </g>
+
+  <!-- Tiny accent sparkles (so it doesn't feel alone) -->
+  <g fill="#f7c948" opacity="0.85">
+    <path d="M 760 200 l 0 -28 l 6 0 l 0 28 z M 746 192 l 28 0 l 0 6 l -28 0 z"/>
+    <path d="M 240 360 l 0 -20 l 4 0 l 0 20 z M 230 354 l 20 0 l 0 4 l -20 0 z"/>
+    <path d="M 820 380 l 0 -16 l 4 0 l 0 16 z M 812 374 l 16 0 l 0 4 l -16 0 z"/>
+  </g>
+</svg>

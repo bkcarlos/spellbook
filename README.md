@@ -1,4 +1,7 @@
-# Spellbook
+<h1>
+  <img src="assets/icon-128.png" alt="" width="48" align="left" style="margin-right:12px"/>
+  Spellbook
+</h1>
 
 > Your personal spellbook of shell incantations. Paste a command, fuzzy-search later, copy with one click.
 

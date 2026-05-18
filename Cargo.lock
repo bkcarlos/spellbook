@@ -3025,6 +3025,7 @@ dependencies = [
  "egui_extras",
  "env_logger",
  "fuzzy-matcher",
+ "image",
  "log",
  "rusqlite",
  "serde",

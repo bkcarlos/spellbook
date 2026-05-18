@@ -12,11 +12,16 @@ use eframe::egui;
 fn main() -> Result<(), eframe::Error> {
     env_logger::init();
 
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([1180.0, 720.0])
+        .with_min_inner_size([760.0, 420.0])
+        .with_title("Spellbook");
+    if let Some(icon) = load_app_icon() {
+        viewport = viewport.with_icon(icon);
+    }
+
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1180.0, 720.0])
-            .with_min_inner_size([760.0, 420.0])
-            .with_title("Spellbook"),
+        viewport,
         ..Default::default()
     };
 
@@ -30,6 +35,18 @@ fn main() -> Result<(), eframe::Error> {
             Ok(Box::new(app::App::new(cc)))
         }),
     )
+}
+
+/// Decode the bundled PNG app icon for the window/Dock.
+fn load_app_icon() -> Option<egui::IconData> {
+    const PNG: &[u8] = include_bytes!("../assets/icon-256.png");
+    let img = image::load_from_memory(PNG).ok()?.to_rgba8();
+    let (w, h) = img.dimensions();
+    Some(egui::IconData {
+        rgba: img.into_raw(),
+        width: w,
+        height: h,
+    })
 }
 
 /// Bundled NotoEmoji font (OFL license, see assets/OFL.txt).

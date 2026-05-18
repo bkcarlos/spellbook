@@ -1,0 +1,19 @@
+# Build artifacts
+/target
+**/*.rs.bk
+
+# OS noise
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*~
+
+# Local logs / temp
+/tmp/
+*.log
+
+# DO NOT ignore assets/NotoEmoji-Regular.ttf — embedded at compile time

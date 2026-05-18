@@ -264,7 +264,27 @@ jobs:
           TOKEN: ${{ secrets.TAP_TOKEN }}
           TAG: ${{ github.ref_name }}
         run: |
-          set -e
+          set -ex
+
+          # ── Token sanity check (most common failure: PAT has read-only perms)
+          echo "::group::Verify TAP_TOKEN can write to homebrew-spellbook"
+          HTTP=$(curl -s -o /tmp/perm.json -w '%{http_code}' \
+            -H "Authorization: Bearer ${TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/bkcarlos/homebrew-spellbook")
+          echo "GET repos/.../homebrew-spellbook → HTTP ${HTTP}"
+          if [ "$HTTP" != "200" ]; then
+            echo "::error::TAP_TOKEN cannot read the tap repo (HTTP $HTTP)."
+            echo "  Generate a PAT at https://github.com/settings/personal-access-tokens/new"
+            echo "  Scoped to bkcarlos/homebrew-spellbook with Contents: Read and write."
+            cat /tmp/perm.json
+            exit 1
+          fi
+          PERMS=$(python3 -c "import json;d=json.load(open('/tmp/perm.json'));p=d.get('permissions',{});print('push='+str(p.get('push',False))+' admin='+str(p.get('admin',False)))" 2>/dev/null || echo 'unknown')
+          echo "Token permissions on tap repo: ${PERMS}"
+          echo "::endgroup::"
+
+          # ── Clone, render, commit, push
           git clone "https://x-access-token:${TOKEN}@github.com/bkcarlos/homebrew-spellbook.git" tap
           cd tap
           mkdir -p Formula Casks
@@ -280,6 +300,10 @@ jobs:
           BRANCH=$(git branch --show-current)
           [ -z "$BRANCH" ] && BRANCH=master
           git commit -m "Bump spellbook to ${TAG}"
-          git push -u origin "$BRANCH"
+          # Force verbose push so any auth error reaches the log
+          GIT_TRACE=1 git push -u origin "$BRANCH" || {
+            echo "::error::git push to tap rejected — check TAP_TOKEN has Contents: Read and write"
+            exit 1
+          }
           echo "  pushed: brew install spellbook  (CLI)"
           echo "          brew install --cask spellbook  (GUI .app)"

@@ -29,7 +29,26 @@ brew install spellbook
 
 Then run `spellbook` from a terminal.
 
-### From source
+### macOS .app bundle (drag-to-Applications, Dock-friendly)
+
+```bash
+git clone https://github.com/bkcarlos/spellbook
+cd spellbook
+./scripts/build_app.sh           # → target/Spellbook.app
+mv target/Spellbook.app /Applications/
+open /Applications/Spellbook.app
+```
+
+First launch shows a Gatekeeper warning (the app is unsigned). Right-click
+→ Open → Open the first time to bypass. After that, just double-click.
+
+To build a universal binary that runs on both arm64 and Intel Macs:
+
+```bash
+./scripts/build_app.sh universal
+```
+
+### From source (CLI)
 
 Requires Rust 1.75+ (`rustup`).
 

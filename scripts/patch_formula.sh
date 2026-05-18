@@ -1,8 +1,14 @@
 #!/usr/bin/env bash
-# Download release archives, compute SHA-256, patch Formula/spellbook.rb.
+# Download release archives, compute SHA-256, patch Formula/spellbook.rb in place.
+# Manual fallback for when CI's publish-tap step is skipped (missing TAP_TOKEN
+# secret) or you need to re-render the formula locally.
+#
 # Usage:  ./scripts/patch_formula.sh [VERSION]
 # Default version: read from Cargo.toml.
-set -euo pipefail
+#
+# Compatible with macOS default bash 3.2 (no associative arrays).
+set -eu
+IFS=$'\n\t'
 
 cd "$(dirname "$0")/.."
 
@@ -14,60 +20,58 @@ BASE="https://github.com/${REPO}/releases/download/v${VERSION}"
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
-declare -A FILES=(
-  [arm64_mac]="spellbook-aarch64-apple-darwin.tar.gz"
-  [intel_mac]="spellbook-x86_64-apple-darwin.tar.gz"
-  [linux]="spellbook-x86_64-unknown-linux-gnu.tar.gz"
-)
-declare -A SHAS
+ARM_FILE="spellbook-aarch64-apple-darwin.tar.gz"
+INTEL_FILE="spellbook-x86_64-apple-darwin.tar.gz"
+LINUX_FILE="spellbook-x86_64-unknown-linux-gnu.tar.gz"
 
-for key in arm64_mac intel_mac linux; do
-  f="${FILES[$key]}"
-  echo "  downloading $f ..."
-  if ! curl -sfL "$BASE/$f" -o "$TMP/$f"; then
-    echo "  ✗ failed to download $f — has the draft release been published?"
-    echo "    https://github.com/${REPO}/releases"
+fetch_sha() {
+  local file="$1"
+  echo "  downloading $file ..." >&2
+  if ! curl -sfL "$BASE/$file" -o "$TMP/$file"; then
+    echo "  ✗ failed to download $file" >&2
+    echo "    (has the v${VERSION} release been published? https://github.com/${REPO}/releases)" >&2
     exit 1
   fi
-  sha=$(shasum -a 256 "$TMP/$f" | awk '{print $1}')
-  SHAS[$key]=$sha
-  echo "  $key: $sha"
-done
+  shasum -a 256 "$TMP/$file" | awk '{print $1}'
+}
 
-# Patch the formula in place using a Python rewrite (handles bumping version + 3 SHAs)
-python3 - <<PY
-import re
+ARM_SHA=$(fetch_sha "$ARM_FILE")
+INTEL_SHA=$(fetch_sha "$INTEL_FILE")
+LINUX_SHA=$(fetch_sha "$LINUX_FILE")
+
+echo "  arm:   $ARM_SHA"
+echo "  intel: $INTEL_SHA"
+echo "  linux: $LINUX_SHA"
+
+VERSION="$VERSION" ARM_SHA="$ARM_SHA" INTEL_SHA="$INTEL_SHA" LINUX_SHA="$LINUX_SHA" python3 <<'PY'
+import os, re
 path = "Formula/spellbook.rb"
-with open(path) as f:
-    s = f.read()
-s = re.sub(r'version\s+"[^"]+"', 'version "${VERSION}"', s, count=1)
-s = s.replace("REPLACE_WITH_ARM64_MAC_SHA256",   "${SHAS[arm64_mac]}")
-s = s.replace("REPLACE_WITH_INTEL_MAC_SHA256",   "${SHAS[intel_mac]}")
-s = s.replace("REPLACE_WITH_LINUX_X86_64_SHA256","${SHAS[linux]}")
-# Also handle re-patching: replace any existing arm/intel/linux sha256 line with the new value
-# (one block at a time; safe because each URL is unique within its on_* branch)
-def repatch(text, marker_url, new_sha):
-    # find the line containing this URL, then replace the next sha256 line
-    lines = text.splitlines()
-    for i, line in enumerate(lines):
-        if marker_url in line:
-            for j in range(i+1, min(i+4, len(lines))):
-                if 'sha256' in lines[j]:
-                    lines[j] = re.sub(r'sha256\s+"[^"]+"', f'sha256 "{new_sha}"', lines[j])
-                    break
-            break
-    return "\n".join(lines) + ("\n" if text.endswith("\n") else "")
-s = repatch(s, "aarch64-apple-darwin",         "${SHAS[arm64_mac]}")
-s = repatch(s, "x86_64-apple-darwin",          "${SHAS[intel_mac]}")
-s = repatch(s, "x86_64-unknown-linux-gnu",     "${SHAS[linux]}")
-with open(path, "w") as f:
-    f.write(s)
+src = open(path).read()
+shas = {
+    "aarch64-apple-darwin":      os.environ["ARM_SHA"],
+    "x86_64-apple-darwin":       os.environ["INTEL_SHA"],
+    "x86_64-unknown-linux-gnu":  os.environ["LINUX_SHA"],
+}
+# Bump version line
+src = re.sub(r'^  version\s+"[^"]+"',
+             f'  version "{os.environ["VERSION"]}"',
+             src, count=1, flags=re.MULTILINE)
+# First pass: replace any leftover REPLACE_WITH_* placeholders
+src = src.replace("REPLACE_WITH_ARM64_MAC_SHA256",     shas["aarch64-apple-darwin"])
+src = src.replace("REPLACE_WITH_INTEL_MAC_SHA256",     shas["x86_64-apple-darwin"])
+src = src.replace("REPLACE_WITH_LINUX_X86_64_SHA256",  shas["x86_64-unknown-linux-gnu"])
+# Second pass: replace already-real SHAs (handles re-patching)
+for target, sha in shas.items():
+    pat = re.compile(
+        r'(url\s+"[^"]*' + re.escape(target) + r'[^"]*"\s*\n\s*sha256\s+)"[^"]*"'
+    )
+    src = pat.sub(lambda m: f'{m.group(1)}"{sha}"', src)
+open(path, "w").write(src)
 print(f"  patched {path}")
 PY
 
 echo
 echo "Formula ready. Next steps:"
-echo "  1. Create repo bkcarlos/homebrew-spellbook (empty)"
-echo "  2. cp Formula/spellbook.rb to that repo as Formula/spellbook.rb"
-echo "  3. Commit & push"
-echo "  4. Verify:  brew tap bkcarlos/spellbook && brew install spellbook"
+echo "  1. clone tap:  git clone git@github.com:bkcarlos/homebrew-spellbook.git"
+echo "  2. cp Formula/spellbook.rb /path/to/tap/Formula/"
+echo "  3. cd tap && git add -A && git commit -m \"Bump spellbook to ${VERSION}\" && git push"

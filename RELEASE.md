@@ -1,64 +1,73 @@
 # Release process
 
-## Cutting a release
-
-1. Bump version in `Cargo.toml` (e.g. `0.1.0` → `0.2.0`).
-2. Commit: `git commit -am "Release v0.2.0"`.
-3. Tag: `git tag v0.2.0`.
-4. Push: `git push origin main --tags`.
-
-The push of a `v*` tag triggers `.github/workflows/release.yml`, which:
-
-- Cross-compiles for `aarch64-apple-darwin`, `x86_64-apple-darwin`, and
-  `x86_64-unknown-linux-gnu`.
-- Packages each as a `.tar.gz`.
-- Computes SHA-256 for each archive.
-- Creates a **draft** GitHub Release with the artifacts attached.
-
-Edit the draft release to add notes, then publish.
-
-## Updating the Homebrew tap
-
-Users install via:
+## TL;DR — releasing v0.2.0
 
 ```bash
+# 1. bump version
+sed -i '' 's/^version = "0.1.0"/version = "0.2.0"/' Cargo.toml
+git commit -am "Release v0.2.0"
+
+# 2. tag + push — CI does everything else
+git tag v0.2.0
+git push origin main --tags
+```
+
+Within ~10 minutes:
+
+- ✅ macOS arm64, macOS x86_64, Linux x86_64 binaries built
+- ✅ GitHub Release published with all 3 archives (not draft)
+- ✅ Homebrew formula auto-bumped + pushed to `bkcarlos/homebrew-spellbook`
+- ✅ Users can `brew upgrade spellbook`
+
+## One-time setup (already done if you're reading this)
+
+### 1. Create the tap repo
+
+GitHub → New repository → `homebrew-spellbook` → Public → empty.
+
+### 2. Create a Personal Access Token (PAT) for CI to push to the tap
+
+GitHub → Settings → Developer settings → Personal access tokens → Fine-grained tokens → Generate new token:
+
+- **Token name**: `spellbook-tap-push`
+- **Repository access**: Only select repositories → `bkcarlos/homebrew-spellbook`
+- **Permissions** → Repository permissions → **Contents**: Read and write
+- **Expiration**: 1 year (set a reminder to rotate)
+
+Copy the token (starts with `github_pat_...`).
+
+### 3. Add it as a secret on the spellbook repo
+
+GitHub → `bkcarlos/spellbook` → Settings → Secrets and variables → Actions → New repository secret:
+
+- **Name**: `TAP_TOKEN`
+- **Value**: paste the PAT
+
+If `TAP_TOKEN` is missing, the publish-tap job logs a friendly skip
+and does nothing — the build still succeeds, you just need to bump
+the formula manually with `scripts/patch_formula.sh`.
+
+## Manual fallback
+
+If CI's tap push fails (PAT expired, etc), fix the formula locally:
+
+```bash
+./scripts/patch_formula.sh                 # patches Formula/spellbook.rb in place
+cp Formula/spellbook.rb /path/to/homebrew-spellbook/Formula/
+( cd /path/to/homebrew-spellbook && git add -A && git commit -m "Bump" && git push )
+```
+
+## Install variants
+
+```bash
+# Homebrew (recommended)
 brew tap bkcarlos/spellbook
 brew install spellbook
-```
 
-That requires a separate repo named `homebrew-spellbook` containing
-`Formula/spellbook.rb`. To bump it after a release:
+# Direct binary download
+curl -L https://github.com/bkcarlos/spellbook/releases/latest/download/spellbook-aarch64-apple-darwin.tar.gz | tar xz
+./spellbook
 
-1. From the workflow output, grab the three SHA-256 values printed by the
-   "Print Homebrew formula stanza" step.
-2. In the `homebrew-spellbook` repo, edit `Formula/spellbook.rb`:
-   - Update `version "X.Y.Z"`.
-   - Replace each `sha256 "..."` with the matching value.
-3. Commit and push.
-
-A copy of the formula template lives at `Formula/spellbook.rb` in **this**
-repo. Keep them in sync.
-
-## First-time tap setup
-
-To create the tap repo:
-
-```bash
-# in a new directory
-mkdir homebrew-spellbook && cd homebrew-spellbook
-git init -b main
-mkdir Formula
-cp /path/to/spellbook/Formula/spellbook.rb Formula/
-git add . && git commit -m "Initial formula"
-gh repo create bkcarlos/homebrew-spellbook --public --source=. --push
-```
-
-After that, the install command above just works for everyone.
-
-## Local install (no Homebrew)
-
-```bash
+# From source
 cargo install --path .
-# or
-cargo build --release && cp target/release/spellbook /usr/local/bin/
 ```

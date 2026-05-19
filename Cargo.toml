@@ -1,6 +1,6 @@
 [package]
 name = "spellbook"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2021"
 description = "Your personal spellbook of shell incantations — local-first command vault with fuzzy search, parameter templates, and optional AI."
 license = "MIT"
@@ -33,6 +33,7 @@ ureq = { version = "2", features = ["json", "tls"] }
 toml = "0.8"
 sha2 = "0.10"
 image = { version = "0.25", default-features = false, features = ["png"] }
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
 
 [profile.release]
 opt-level = 3

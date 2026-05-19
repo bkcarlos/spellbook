@@ -106,7 +106,8 @@ impl LlmConfig {
         Ok(())
     }
 
-    /// Configured = has provider, model, and either local-Ollama or an api key in env.
+    /// Configured = has provider, model, and either local-Ollama or an api key
+    /// (env var first, then OS keychain).
     pub fn is_configured(&self) -> bool {
         if self.model.trim().is_empty() {
             return false;
@@ -114,9 +115,7 @@ impl LlmConfig {
         if self.is_local() {
             return true;
         }
-        std::env::var(&self.api_key_env)
-            .map(|v| !v.trim().is_empty())
-            .unwrap_or(false)
+        self.resolve_api_key().is_some()
     }
 
     pub fn is_local(&self) -> bool {
@@ -127,12 +126,76 @@ impl LlmConfig {
         if self.model.trim().is_empty() {
             return Some("未配置模型名".into());
         }
-        if !self.is_local()
-            && std::env::var(&self.api_key_env).map(|v| v.trim().is_empty()).unwrap_or(true)
-        {
-            return Some(format!("环境变量 {} 未设置", self.api_key_env));
+        if !self.is_local() && self.resolve_api_key().is_none() {
+            return Some(format!(
+                "API key 未配置（环境变量 {} 或在设置中保存到系统 Keychain）",
+                self.api_key_env
+            ));
         }
         None
+    }
+
+    /// Env var wins (power-user override); Keychain is the fallback so GUI
+    /// users launching from Finder/Dock have a way to provide a key.
+    pub fn resolve_api_key(&self) -> Option<String> {
+        if let Ok(v) = std::env::var(&self.api_key_env) {
+            if !v.trim().is_empty() {
+                return Some(v);
+            }
+        }
+        keyring_get(&self.api_key_env)
+    }
+
+    /// What's the active source of the key (for UI labelling)?
+    pub fn api_key_source(&self) -> ApiKeySource {
+        if let Ok(v) = std::env::var(&self.api_key_env) {
+            if !v.trim().is_empty() {
+                return ApiKeySource::Env;
+            }
+        }
+        if keyring_get(&self.api_key_env).is_some() {
+            ApiKeySource::Keychain
+        } else {
+            ApiKeySource::None
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApiKeySource {
+    Env,
+    Keychain,
+    None,
+}
+
+// ============================================================================
+// Keychain helpers — wrapped so backend failures (e.g. no Secret Service on
+// a headless Linux box) are silent rather than crashing the app.
+// ============================================================================
+
+const KEYRING_SERVICE: &str = "Spellbook";
+
+fn keyring_get(env_name: &str) -> Option<String> {
+    let entry = keyring::Entry::new(KEYRING_SERVICE, env_name).ok()?;
+    entry.get_password().ok()
+}
+
+pub fn keyring_set(env_name: &str, key: &str) -> Result<()> {
+    let entry = keyring::Entry::new(KEYRING_SERVICE, env_name)
+        .map_err(|e| anyhow!("keychain entry: {e}"))?;
+    entry
+        .set_password(key)
+        .map_err(|e| anyhow!("keychain write: {e}"))?;
+    Ok(())
+}
+
+pub fn keyring_delete(env_name: &str) -> Result<()> {
+    let entry = keyring::Entry::new(KEYRING_SERVICE, env_name)
+        .map_err(|e| anyhow!("keychain entry: {e}"))?;
+    match entry.delete_credential() {
+        Ok(_) => Ok(()),
+        Err(keyring::Error::NoEntry) => Ok(()), // already gone
+        Err(e) => Err(anyhow!("keychain delete: {e}")),
     }
 }
 
@@ -147,8 +210,9 @@ fn complete(config: &LlmConfig, system: &str, user: &str) -> Result<String> {
     let api_key = if config.is_local() {
         String::new()
     } else {
-        std::env::var(&config.api_key_env)
-            .map_err(|_| anyhow!("env {} not set", config.api_key_env))?
+        config.resolve_api_key().ok_or_else(|| {
+            anyhow!("API key not set (env {} or keychain)", config.api_key_env)
+        })?
     };
     match config.provider {
         Provider::OpenAi => complete_openai(config, &api_key, system, user),

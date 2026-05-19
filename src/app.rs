@@ -72,6 +72,8 @@ pub struct App {
     show_settings: bool,
     settings_draft: Option<LlmConfig>,
     settings_test_msg: Option<String>,
+    settings_api_key_input: String,
+    settings_api_key_visible: bool,
     nl_gen: Option<NlGenState>,
     pending_consent: Option<ConsentSubject>,
 
@@ -201,6 +203,8 @@ impl App {
             show_settings: false,
             settings_draft: None,
             settings_test_msg: None,
+            settings_api_key_input: String::new(),
+            settings_api_key_visible: false,
             nl_gen: None,
             pending_consent: None,
             last_deleted: None,
@@ -2574,6 +2578,69 @@ impl App {
                         );
                         ui.end_row();
 
+                        // API key value — Keychain-backed (with env-var override visible)
+                        ui.label("API key");
+                        ui.vertical(|ui| {
+                            let source = draft.api_key_source();
+                            let (label_txt, label_color) = match source {
+                                crate::llm::ApiKeySource::Env => (
+                                    format!("从环境变量 ${} 读取（优先于 Keychain）", draft.api_key_env),
+                                    Color32::from_rgb(120, 180, 240),
+                                ),
+                                crate::llm::ApiKeySource::Keychain => (
+                                    "已保存到系统 Keychain".to_string(),
+                                    Color32::from_rgb(140, 200, 140),
+                                ),
+                                crate::llm::ApiKeySource::None => (
+                                    "未配置".to_string(),
+                                    Color32::from_rgb(200, 140, 60),
+                                ),
+                            };
+                            ui.label(RichText::new(label_txt).small().color(label_color));
+                            ui.horizontal(|ui| {
+                                let r = ui.add(
+                                    TextEdit::singleline(&mut self.settings_api_key_input)
+                                        .password(!self.settings_api_key_visible)
+                                        .hint_text("sk-... (粘贴 key 然后点保存)")
+                                        .desired_width(280.0),
+                                );
+                                let _ = r;
+                                let eye = if self.settings_api_key_visible { "🙈" } else { "👁" };
+                                if ui.small_button(eye).on_hover_text("显示/隐藏").clicked() {
+                                    self.settings_api_key_visible = !self.settings_api_key_visible;
+                                }
+                            });
+                            ui.horizontal(|ui| {
+                                let can_save = !self.settings_api_key_input.trim().is_empty();
+                                if ui
+                                    .add_enabled(can_save, egui::Button::new("💾 存到 Keychain"))
+                                    .clicked()
+                                {
+                                    let env_name = draft.api_key_env.clone();
+                                    let key = self.settings_api_key_input.trim().to_string();
+                                    match crate::llm::keyring_set(&env_name, &key) {
+                                        Ok(_) => {
+                                            self.toast_success("已存入 Keychain");
+                                            self.settings_api_key_input.clear();
+                                        }
+                                        Err(e) => self.toast_error(format!("存 Keychain 失败: {e}")),
+                                    }
+                                }
+                                if source == crate::llm::ApiKeySource::Keychain {
+                                    if ui
+                                        .button(RichText::new("🗑 删除").color(Color32::from_rgb(200, 80, 80)))
+                                        .clicked()
+                                    {
+                                        match crate::llm::keyring_delete(&draft.api_key_env) {
+                                            Ok(_) => self.toast_success("已从 Keychain 删除"),
+                                            Err(e) => self.toast_error(format!("删除失败: {e}")),
+                                        }
+                                    }
+                                }
+                            });
+                        });
+                        ui.end_row();
+
                         ui.label("超时（秒）");
                         ui.add(egui::DragValue::new(&mut draft.timeout_secs).range(3..=60));
                         ui.end_row();
@@ -2667,6 +2734,8 @@ impl App {
             self.show_settings = false;
             self.settings_draft = None;
             self.settings_test_msg = None;
+            self.settings_api_key_input.clear();
+            self.settings_api_key_visible = false;
             return;
         }
 
@@ -2674,6 +2743,8 @@ impl App {
             self.show_settings = false;
             self.settings_draft = None;
             self.settings_test_msg = None;
+            self.settings_api_key_input.clear();
+            self.settings_api_key_visible = false;
         } else {
             self.settings_draft = Some(draft);
         }

@@ -60,7 +60,9 @@ jobs:
             ARCHIVE="spellbook-${TARGET}.tar.gz"
             tar -C "target/${TARGET}/release" -czf "dist/${ARCHIVE}" "${BIN}"
           fi
-          shasum -a 256 "dist/${ARCHIVE}" | awk '{print $1}' > "dist/${ARCHIVE}.sha256"
+          # Portable SHA-256 (shasum is missing on Git Bash for Windows)
+          python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' \
+            "dist/${ARCHIVE}" > "dist/${ARCHIVE}.sha256"
           ls -lh "dist/"
 
       - uses: actions/upload-artifact@v4

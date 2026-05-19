@@ -1271,7 +1271,7 @@ impl App {
                 self.copy_command(cmd_id);
             }
             if self.llm.config.features.explain_command
-                && self.llm.config.is_configured()
+                && self.llm.is_configured()
                 && !self.llm.config.offline_mode
             {
                 let busy = self.llm.is_busy(JobKind::Explain);
@@ -1305,7 +1305,7 @@ impl App {
             ui.label(RichText::new("说明 (Markdown)").weak());
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if self.llm.config.features.generate_description
-                    && self.llm.config.is_configured()
+                    && self.llm.is_configured()
                     && !self.llm.config.offline_mode
                 {
                     let label = if describing { "🧠 生成中…" } else { "✨ AI 生成" };
@@ -1779,7 +1779,7 @@ impl App {
 
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    if ui.button(RichText::new("💾 保存 (Enter)").strong()).clicked() {
+                    if ui.button(RichText::new("💾 保存 (Cmd+Enter)").strong()).clicked() {
                         do_save = true;
                     }
                     if ui.button("取消 (Esc)").clicked() {
@@ -1787,14 +1787,15 @@ impl App {
                     }
                 });
 
-                // Enter / Cmd+Enter to save when focus is not inside multiline
-                let enter = ui.input(|i| {
-                    (i.key_pressed(Key::Enter) && i.modifiers.command)
-                        || (i.key_pressed(Key::Enter)
-                            && !i.modifiers.shift
-                            && !cmd_resp.has_focus())
+                // ONLY Cmd/Ctrl+Enter saves. Bare Enter is always handed to
+                // the focused TextEdit (newline in multiline, tag-submit in
+                // singleline). Previous logic could accidentally fire save
+                // when adding a newline in the command field.
+                let _ = cmd_resp;
+                let cmd_enter = ui.input(|i| {
+                    i.key_pressed(Key::Enter) && i.modifiers.command
                 });
-                if enter {
+                if cmd_enter {
                     do_save = true;
                 }
             });
@@ -2464,11 +2465,11 @@ impl App {
             .show(ctx, |ui| {
                 ui.label(RichText::new("用自然语言描述，AI 帮你写命令").weak());
                 ui.add_space(6.0);
-                if !self.llm.config.is_configured() {
+                if !self.llm.is_configured() {
                     ui.label(
                         RichText::new(format!(
                             "⚠ LLM 未配置：{}。在「设置」中配置后再试。",
-                            self.llm.config.missing_reason().unwrap_or_default()
+                            self.llm.missing_reason().unwrap_or_default()
                         ))
                         .color(Color32::from_rgb(200, 140, 60)),
                     );
@@ -2493,7 +2494,7 @@ impl App {
                 ui.horizontal(|ui| {
                     let enabled = !st.in_flight
                         && !st.prompt.trim().is_empty()
-                        && self.llm.config.is_configured();
+                        && self.llm.is_configured();
                     if ui
                         .add_enabled(enabled, egui::Button::new(RichText::new("🪄 生成").strong()))
                         .clicked()
@@ -2581,7 +2582,7 @@ impl App {
                         // API key value — Keychain-backed (with env-var override visible)
                         ui.label("API key");
                         ui.vertical(|ui| {
-                            let source = draft.api_key_source();
+                            let source = self.llm.api_key_source();
                             let (label_txt, label_color) = match source {
                                 crate::llm::ApiKeySource::Env => (
                                     format!("从环境变量 ${} 读取（优先于 Keychain）", draft.api_key_env),
@@ -2622,6 +2623,7 @@ impl App {
                                         Ok(_) => {
                                             self.toast_success("已存入 Keychain");
                                             self.settings_api_key_input.clear();
+                                            self.llm.refresh_api_key_cache();
                                         }
                                         Err(e) => self.toast_error(format!("存 Keychain 失败: {e}")),
                                     }
@@ -2632,7 +2634,10 @@ impl App {
                                         .clicked()
                                     {
                                         match crate::llm::keyring_delete(&draft.api_key_env) {
-                                            Ok(_) => self.toast_success("已从 Keychain 删除"),
+                                            Ok(_) => {
+                                                self.toast_success("已从 Keychain 删除");
+                                                self.llm.refresh_api_key_cache();
+                                            }
                                             Err(e) => self.toast_error(format!("删除失败: {e}")),
                                         }
                                     }
@@ -2675,7 +2680,7 @@ impl App {
                 ui.add_space(4.0);
                 ui.checkbox(&mut draft.offline_mode, "🚫 离线模式（完全禁用远程调用）");
 
-                if let Some(reason) = draft.missing_reason() {
+                if let Some(reason) = self.llm.missing_reason() {
                     ui.add_space(6.0);
                     ui.label(
                         RichText::new(format!("⚠ {reason}"))

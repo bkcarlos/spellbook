@@ -106,58 +106,8 @@ impl LlmConfig {
         Ok(())
     }
 
-    /// Configured = has provider, model, and either local-Ollama or an api key
-    /// (env var first, then OS keychain).
-    pub fn is_configured(&self) -> bool {
-        if self.model.trim().is_empty() {
-            return false;
-        }
-        if self.is_local() {
-            return true;
-        }
-        self.resolve_api_key().is_some()
-    }
-
     pub fn is_local(&self) -> bool {
         self.base_url.contains("localhost") || self.base_url.contains("127.0.0.1")
-    }
-
-    pub fn missing_reason(&self) -> Option<String> {
-        if self.model.trim().is_empty() {
-            return Some("未配置模型名".into());
-        }
-        if !self.is_local() && self.resolve_api_key().is_none() {
-            return Some(format!(
-                "API key 未配置（环境变量 {} 或在设置中保存到系统 Keychain）",
-                self.api_key_env
-            ));
-        }
-        None
-    }
-
-    /// Env var wins (power-user override); Keychain is the fallback so GUI
-    /// users launching from Finder/Dock have a way to provide a key.
-    pub fn resolve_api_key(&self) -> Option<String> {
-        if let Ok(v) = std::env::var(&self.api_key_env) {
-            if !v.trim().is_empty() {
-                return Some(v);
-            }
-        }
-        keyring_get(&self.api_key_env)
-    }
-
-    /// What's the active source of the key (for UI labelling)?
-    pub fn api_key_source(&self) -> ApiKeySource {
-        if let Ok(v) = std::env::var(&self.api_key_env) {
-            if !v.trim().is_empty() {
-                return ApiKeySource::Env;
-            }
-        }
-        if keyring_get(&self.api_key_env).is_some() {
-            ApiKeySource::Keychain
-        } else {
-            ApiKeySource::None
-        }
     }
 }
 
@@ -203,20 +153,13 @@ pub fn keyring_delete(env_name: &str) -> Result<()> {
 // Provider-level HTTP
 // ============================================================================
 
-fn complete(config: &LlmConfig, system: &str, user: &str) -> Result<String> {
+fn complete(config: &LlmConfig, api_key: &str, system: &str, user: &str) -> Result<String> {
     if config.offline_mode {
         bail!("offline mode");
     }
-    let api_key = if config.is_local() {
-        String::new()
-    } else {
-        config.resolve_api_key().ok_or_else(|| {
-            anyhow!("API key not set (env {} or keychain)", config.api_key_env)
-        })?
-    };
     match config.provider {
-        Provider::OpenAi => complete_openai(config, &api_key, system, user),
-        Provider::Anthropic => complete_anthropic(config, &api_key, system, user),
+        Provider::OpenAi => complete_openai(config, api_key, system, user),
+        Provider::Anthropic => complete_anthropic(config, api_key, system, user),
     }
 }
 
@@ -411,22 +354,77 @@ pub struct LlmManager {
     cache: HashMap<String, EnhanceResult>,
     recent_calls: VecDeque<Instant>,
     blocklist: Vec<String>,
+    // Cached API key + source so UI threads never block on Keychain.
+    cached_api_key: Option<String>,
+    cached_api_key_source: ApiKeySource,
 }
 
 impl LlmManager {
     pub fn load() -> Self {
         let config = LlmConfig::load_or_default();
-        Self {
+        let mut s = Self {
             config,
             pending: Vec::new(),
             cache: HashMap::new(),
             recent_calls: VecDeque::new(),
             blocklist: default_blocklist(),
-        }
+            cached_api_key: None,
+            cached_api_key_source: ApiKeySource::None,
+        };
+        s.refresh_api_key_cache();
+        s
     }
 
-    pub fn save_config(&self) -> Result<()> {
-        self.config.save()
+    pub fn save_config(&mut self) -> Result<()> {
+        self.config.save()?;
+        // Provider may have changed → re-resolve key.
+        self.refresh_api_key_cache();
+        Ok(())
+    }
+
+    /// Resolve api key (env first, keychain second) and cache result.
+    /// This is the ONLY place keyring is touched on the UI thread — done
+    /// once at startup + after config save / explicit refresh.
+    pub fn refresh_api_key_cache(&mut self) {
+        if let Ok(v) = std::env::var(&self.config.api_key_env) {
+            if !v.trim().is_empty() {
+                self.cached_api_key = Some(v);
+                self.cached_api_key_source = ApiKeySource::Env;
+                return;
+            }
+        }
+        if let Some(v) = keyring_get(&self.config.api_key_env) {
+            self.cached_api_key = Some(v);
+            self.cached_api_key_source = ApiKeySource::Keychain;
+            return;
+        }
+        self.cached_api_key = None;
+        self.cached_api_key_source = ApiKeySource::None;
+    }
+
+    /// Cache-only is_configured (no keyring access).
+    pub fn is_configured(&self) -> bool {
+        if self.config.model.trim().is_empty() {
+            return false;
+        }
+        self.config.is_local() || self.cached_api_key.is_some()
+    }
+
+    pub fn api_key_source(&self) -> ApiKeySource {
+        self.cached_api_key_source
+    }
+
+    pub fn missing_reason(&self) -> Option<String> {
+        if self.config.model.trim().is_empty() {
+            return Some("未配置模型名".into());
+        }
+        if !self.config.is_local() && self.cached_api_key.is_none() {
+            return Some(format!(
+                "API key 未配置（环境变量 {} 或在设置中保存到系统 Keychain）",
+                self.config.api_key_env
+            ));
+        }
+        None
     }
 
     pub fn in_flight(&self) -> bool {
@@ -472,7 +470,7 @@ impl LlmManager {
     pub fn can_paste_enhance(&self, command: &str) -> bool {
         self.config.features.paste_enhance
             && self.config.consent.paste_enhance.is_some()
-            && self.config.is_configured()
+            && self.is_configured()
             && !self.config.offline_mode
             && command.trim().len() >= 10
             && !self.is_dangerous(command)
@@ -501,6 +499,7 @@ impl LlmManager {
         self.record_call();
 
         let config = self.config.clone();
+        let api_key = self.cached_api_key.clone().unwrap_or_default();
         let cmd = command.to_string();
         let rule_title = rule_title.to_string();
         let rule_category = rule_category.to_string();
@@ -509,7 +508,7 @@ impl LlmManager {
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
             let user = prompt_enhance(&cmd, &rule_title, &rule_category, &rule_tags_str);
-            let result = complete(&config, SYS_ENHANCE, &user)
+            let result = complete(&config, &api_key, SYS_ENHANCE, &user)
                 .and_then(|text| parse_enhance(&text))
                 .map(JobOutput::Enhance);
             let _ = tx.send(result);
@@ -526,14 +525,15 @@ impl LlmManager {
     }
 
     pub fn generate_description(&mut self, title: &str, command: &str, target_id: Option<i64>) {
-        if !self.config.is_configured() || self.config.offline_mode {
+        if !self.is_configured() || self.config.offline_mode {
             return;
         }
         let config = self.config.clone();
+        let api_key = self.cached_api_key.clone().unwrap_or_default();
         let user = prompt_describe(title, command);
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let result = complete(&config, SYS_DESCRIBE, &user).map(JobOutput::Text);
+            let result = complete(&config, &api_key, SYS_DESCRIBE, &user).map(JobOutput::Text);
             let _ = tx.send(result);
         });
         self.record_call();
@@ -547,14 +547,15 @@ impl LlmManager {
     }
 
     pub fn generate_command(&mut self, prompt: &str) {
-        if !self.config.is_configured() || self.config.offline_mode {
+        if !self.is_configured() || self.config.offline_mode {
             return;
         }
         let config = self.config.clone();
+        let api_key = self.cached_api_key.clone().unwrap_or_default();
         let user = prompt_generate(prompt);
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let result = complete(&config, SYS_GENERATE, &user)
+            let result = complete(&config, &api_key, SYS_GENERATE, &user)
                 .and_then(|text| parse_generate(&text))
                 .map(JobOutput::Generate);
             let _ = tx.send(result);
@@ -570,14 +571,15 @@ impl LlmManager {
     }
 
     pub fn explain(&mut self, command: &str, target_id: i64) {
-        if !self.config.is_configured() || self.config.offline_mode {
+        if !self.is_configured() || self.config.offline_mode {
             return;
         }
         let config = self.config.clone();
+        let api_key = self.cached_api_key.clone().unwrap_or_default();
         let user = prompt_explain(command);
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let result = complete(&config, SYS_EXPLAIN, &user).map(JobOutput::Text);
+            let result = complete(&config, &api_key, SYS_EXPLAIN, &user).map(JobOutput::Text);
             let _ = tx.send(result);
         });
         self.record_call();
@@ -634,8 +636,10 @@ impl LlmManager {
     }
 
     pub fn test_connection(&self) -> Result<String> {
+        let api_key = self.cached_api_key.clone().unwrap_or_default();
         complete(
             &self.config,
+            &api_key,
             "你是测试助手，回复 'ok'。",
             "请回复 'ok'。",
         )
@@ -834,9 +838,9 @@ mod tests {
 
     #[test]
     fn missing_reason_flags_empty_model() {
-        let mut c = LlmConfig::default();
-        c.model = "".into();
-        assert!(c.missing_reason().is_some());
+        let mut m = LlmManager::load();
+        m.config.model = "".into();
+        assert!(m.missing_reason().is_some());
     }
 
     #[test]

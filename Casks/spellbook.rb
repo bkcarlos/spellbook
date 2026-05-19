@@ -20,6 +20,17 @@ cask "spellbook" do
 
   app "Spellbook.app"
 
+  # Spellbook isn't notarized with an Apple Developer ID (would cost
+  # $99/yr), so Homebrew's default quarantine attribute would trigger
+  # Gatekeeper's "cannot verify developer" warning on first launch.
+  # The binary IS ad-hoc signed (rust linker does that for arm64 macOS),
+  # so once quarantine is removed it launches fine.
+  postflight do
+    system_command "/usr/bin/xattr",
+                   args:         ["-dr", "com.apple.quarantine", "#{appdir}/Spellbook.app"],
+                   must_succeed: false
+  end
+
   zap trash: [
     "~/Library/Application Support/Spellbook",
     "~/Library/Caches/Spellbook",

@@ -163,9 +163,12 @@ fn complete(config: &LlmConfig, api_key: &str, system: &str, user: &str) -> Resu
     }
 }
 
-fn complete_openai(config: &LlmConfig, api_key: &str, system: &str, user: &str) -> Result<String> {
-    let url = format!("{}/chat/completions", config.base_url.trim_end_matches('/'));
-    let body = serde_json::json!({
+fn openai_url(config: &LlmConfig) -> String {
+    format!("{}/chat/completions", config.base_url.trim_end_matches('/'))
+}
+
+fn openai_body(config: &LlmConfig, system: &str, user: &str) -> serde_json::Value {
+    serde_json::json!({
         "model": config.model,
         "messages": [
             { "role": "system", "content": system },
@@ -174,7 +177,25 @@ fn complete_openai(config: &LlmConfig, api_key: &str, system: &str, user: &str) 
         "max_tokens": config.max_tokens,
         "temperature": 0.2,
         "stream": false,
-    });
+    })
+}
+
+fn anthropic_url(config: &LlmConfig) -> String {
+    format!("{}/messages", config.base_url.trim_end_matches('/'))
+}
+
+fn anthropic_body(config: &LlmConfig, system: &str, user: &str) -> serde_json::Value {
+    serde_json::json!({
+        "model": config.model,
+        "max_tokens": config.max_tokens,
+        "system": system,
+        "messages": [{ "role": "user", "content": user }],
+    })
+}
+
+fn complete_openai(config: &LlmConfig, api_key: &str, system: &str, user: &str) -> Result<String> {
+    let url = openai_url(config);
+    let body = openai_body(config, system, user);
     let agent = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(config.timeout_secs))
         .build();
@@ -202,13 +223,8 @@ fn complete_anthropic(
     system: &str,
     user: &str,
 ) -> Result<String> {
-    let url = format!("{}/messages", config.base_url.trim_end_matches('/'));
-    let body = serde_json::json!({
-        "model": config.model,
-        "max_tokens": config.max_tokens,
-        "system": system,
-        "messages": [{ "role": "user", "content": user }],
-    });
+    let url = anthropic_url(config);
+    let body = anthropic_body(config, system, user);
     let agent = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(config.timeout_secs))
         .build();
@@ -635,6 +651,35 @@ impl LlmManager {
         self.cache.insert(hash(command), result);
     }
 
+    /// Build a redacted preview of the HTTP request that *would* be sent
+    /// for an Enhance call. The api key is replaced with a placeholder so
+    /// the preview can be displayed in UI / logs without leaking secrets.
+    pub fn preview_enhance(
+        &self,
+        command: &str,
+        rule_title: &str,
+        rule_category: &str,
+        rule_tags: &[String],
+    ) -> RequestPreview {
+        let user = prompt_enhance(command, rule_title, rule_category, &rule_tags.join(", "));
+        build_preview(&self.config, SYS_ENHANCE, &user, "粘贴即增强（Enhance）")
+    }
+
+    pub fn preview_describe(&self, title: &str, command: &str) -> RequestPreview {
+        let user = prompt_describe(title, command);
+        build_preview(&self.config, SYS_DESCRIBE, &user, "生成 description（Describe）")
+    }
+
+    pub fn preview_generate(&self, prompt: &str) -> RequestPreview {
+        let user = prompt_generate(prompt);
+        build_preview(&self.config, SYS_GENERATE, &user, "自然语言生成命令（Generate）")
+    }
+
+    pub fn preview_explain(&self, command: &str) -> RequestPreview {
+        let user = prompt_explain(command);
+        build_preview(&self.config, SYS_EXPLAIN, &user, "命令解释（Explain）")
+    }
+
     pub fn test_connection(&self) -> Result<String> {
         let api_key = self.cached_api_key.clone().unwrap_or_default();
         complete(
@@ -667,6 +712,75 @@ fn default_blocklist() -> Vec<String> {
         "dd if=/dev/zero of=/dev/".into(),
         "> /dev/sda".into(),
     ]
+}
+
+// ============================================================================
+// Request preview (for the "查看本次将发送" privacy panel)
+// ============================================================================
+
+/// A redacted view of the HTTP request that would be sent for an LLM call.
+/// Used by the privacy preview UI; the api key is never present here — only
+/// a placeholder that names which env var / keychain entry it would come from.
+#[derive(Debug, Clone)]
+pub struct RequestPreview {
+    /// User-facing label for the call ("粘贴即增强", "命令解释", …).
+    pub feature_label: String,
+    pub provider_label: String,
+    pub url: String,
+    pub headers: Vec<(String, String)>,
+    pub body_json: String,
+    /// True when the config makes this call impossible (offline mode etc.).
+    /// The UI surfaces this so the user knows a click would have been a no-op.
+    pub would_skip: Option<String>,
+}
+
+fn build_preview(
+    config: &LlmConfig,
+    system: &str,
+    user: &str,
+    feature_label: &str,
+) -> RequestPreview {
+    let key_placeholder = format!("<API key from env var `{}` or Keychain>", config.api_key_env);
+
+    let (url, headers, body) = match config.provider {
+        Provider::OpenAi => {
+            let url = openai_url(config);
+            let mut headers = vec![("Content-Type".into(), "application/json".into())];
+            if !config.is_local() {
+                headers.push(("Authorization".into(), format!("Bearer {key_placeholder}")));
+            }
+            let body = openai_body(config, system, user);
+            (url, headers, body)
+        }
+        Provider::Anthropic => {
+            let url = anthropic_url(config);
+            let headers = vec![
+                ("Content-Type".into(), "application/json".into()),
+                ("anthropic-version".into(), "2023-06-01".into()),
+                ("x-api-key".into(), key_placeholder),
+            ];
+            let body = anthropic_body(config, system, user);
+            (url, headers, body)
+        }
+    };
+
+    let body_json = serde_json::to_string_pretty(&body)
+        .unwrap_or_else(|_| "<failed to serialize body>".to_string());
+
+    let would_skip = if config.offline_mode {
+        Some("离线模式已开启,实际不会发送".into())
+    } else {
+        None
+    };
+
+    RequestPreview {
+        feature_label: feature_label.to_string(),
+        provider_label: config.provider.label().to_string(),
+        url,
+        headers,
+        body_json,
+        would_skip,
+    }
 }
 
 // ============================================================================
@@ -882,5 +996,70 @@ mod tests {
         m.config.model = "llama".into();
         m.config.offline_mode = true;
         assert!(!m.can_paste_enhance("docker ps -a"));
+    }
+
+    #[test]
+    fn preview_openai_redacts_key_and_includes_user_prompt() {
+        let mut m = LlmManager::load();
+        m.config.provider = Provider::OpenAi;
+        m.config.base_url = "https://api.openai.com/v1".into();
+        m.config.model = "gpt-4o-mini".into();
+        m.config.api_key_env = "OPENAI_API_KEY".into();
+        let p = m.preview_explain("docker container prune -f");
+        assert!(p.url.contains("/chat/completions"));
+        assert_eq!(p.provider_label, "OpenAI compatible");
+        // auth header must reference env var, never an actual key
+        let auth = p
+            .headers
+            .iter()
+            .find(|(k, _)| k == "Authorization")
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default();
+        assert!(auth.contains("OPENAI_API_KEY"), "got auth = {auth}");
+        assert!(!auth.contains("sk-"), "actual key leaked: {auth}");
+        // body should include the command we want explained
+        assert!(p.body_json.contains("docker container prune"));
+    }
+
+    #[test]
+    fn preview_anthropic_uses_x_api_key_header() {
+        let mut m = LlmManager::load();
+        m.config.provider = Provider::Anthropic;
+        m.config.base_url = "https://api.anthropic.com/v1".into();
+        m.config.model = "claude-sonnet-4-6".into();
+        m.config.api_key_env = "ANTHROPIC_API_KEY".into();
+        let p = m.preview_generate("list running docker containers");
+        assert!(p.url.ends_with("/messages"));
+        let header_keys: Vec<&str> = p.headers.iter().map(|(k, _)| k.as_str()).collect();
+        assert!(header_keys.contains(&"x-api-key"));
+        assert!(header_keys.contains(&"anthropic-version"));
+        let xkey = p
+            .headers
+            .iter()
+            .find(|(k, _)| k == "x-api-key")
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default();
+        assert!(xkey.contains("ANTHROPIC_API_KEY"));
+        assert!(p.body_json.contains("running docker containers"));
+    }
+
+    #[test]
+    fn preview_local_base_url_omits_authorization() {
+        let mut m = LlmManager::load();
+        m.config.provider = Provider::OpenAi;
+        m.config.base_url = "http://localhost:11434/v1".into();
+        m.config.model = "llama3".into();
+        let p = m.preview_describe("test", "ls -la");
+        // local base url → no auth header (Ollama / LM Studio typically need none)
+        assert!(!p.headers.iter().any(|(k, _)| k == "Authorization"),
+            "headers = {:?}", p.headers);
+    }
+
+    #[test]
+    fn preview_offline_mode_flags_skip() {
+        let mut m = LlmManager::load();
+        m.config.offline_mode = true;
+        let p = m.preview_explain("git log --oneline");
+        assert!(p.would_skip.is_some());
     }
 }

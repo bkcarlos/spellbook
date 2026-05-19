@@ -1,4 +1,7 @@
-use std::collections::HashSet;
+use serde::Deserialize;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+use std::sync::OnceLock;
 
 #[derive(Debug, Clone, Default)]
 pub struct Inference {
@@ -8,11 +11,118 @@ pub struct Inference {
     pub tags: Vec<String>,
 }
 
+/// User-supplied overrides for the inference rule engine. Loaded from
+/// `~/.config/Spellbook/inference_rules.json` once per process. All three
+/// fields are optional; missing ones fall back to the built-in dictionaries.
+///
+/// Semantics:
+/// - `category_map`: per-tool override. User entries take precedence over
+///   the built-in match arm. Lookup is case-sensitive on the lowercased
+///   command first token.
+/// - `tool_tags`: extends the built-in `KNOWN_TOOLS` whitelist (Rule 1).
+/// - `verb_tags`: per-verb override. User entries take precedence over
+///   the built-in `VERB_TAGS` list (Rule 2).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct InferenceRules {
+    #[serde(default)]
+    pub category_map: HashMap<String, String>,
+    #[serde(default)]
+    pub tool_tags: Vec<String>,
+    #[serde(default)]
+    pub verb_tags: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone)]
+pub enum RulesStatus {
+    /// No file present — defaults only.
+    Absent,
+    Loaded {
+        path: PathBuf,
+        categories: usize,
+        tools: usize,
+        verbs: usize,
+    },
+    ParseError {
+        path: PathBuf,
+        error: String,
+    },
+}
+
+impl InferenceRules {
+    /// PRD §7.2.4: `~/.config/Spellbook/inference_rules.json`.
+    pub fn config_path() -> Option<PathBuf> {
+        let base = dirs::config_dir()?;
+        Some(base.join("Spellbook").join("inference_rules.json"))
+    }
+
+    /// Read the user override file. Silent on every failure mode — the
+    /// rules engine must keep working with built-ins even if the file is
+    /// missing, unreadable, or malformed.
+    pub fn load() -> (Self, RulesStatus) {
+        let Some(path) = Self::config_path() else {
+            return (Self::default(), RulesStatus::Absent);
+        };
+        let Ok(s) = std::fs::read_to_string(&path) else {
+            return (Self::default(), RulesStatus::Absent);
+        };
+        match serde_json::from_str::<Self>(&s) {
+            Ok(r) => {
+                let status = RulesStatus::Loaded {
+                    path,
+                    categories: r.category_map.len(),
+                    tools: r.tool_tags.len(),
+                    verbs: r.verb_tags.len(),
+                };
+                (r, status)
+            }
+            Err(e) => (
+                Self::default(),
+                RulesStatus::ParseError { path, error: e.to_string() },
+            ),
+        }
+    }
+}
+
+/// Lazily-initialized process-wide rules. First call loads from disk; later
+/// calls return the same instance. Edits to the JSON file require a restart.
+fn runtime_rules() -> &'static InferenceRules {
+    static R: OnceLock<InferenceRules> = OnceLock::new();
+    R.get_or_init(|| {
+        let (rules, status) = InferenceRules::load();
+        match &status {
+            RulesStatus::Absent => {}
+            RulesStatus::Loaded { path, categories, tools, verbs } => {
+                log::info!(
+                    "inference: loaded user rules from {} ({categories} cats, {tools} tools, {verbs} verbs)",
+                    path.display()
+                );
+            }
+            RulesStatus::ParseError { path, error } => {
+                log::warn!(
+                    "inference: failed to parse {} — using built-ins ({error})",
+                    path.display()
+                );
+            }
+        }
+        rules
+    })
+}
+
+/// Snapshot of the current rules status. Returns the result of `load()` so
+/// callers (settings UI, About panel) can surface it without re-reading.
+pub fn rules_status() -> RulesStatus {
+    InferenceRules::load().1
+}
+
 pub fn infer(raw: &str) -> Inference {
+    infer_with(raw, runtime_rules())
+}
+
+pub fn infer_with(raw: &str, rules: &InferenceRules) -> Inference {
     let (title, command) = split_title_and_command(raw);
     let tokens = tokenize(&command);
-    let category = infer_category(&tokens);
-    let tags = infer_tags(&tokens, &command);
+    let category = infer_category(&tokens, rules);
+    let tags = infer_tags(&tokens, &command, rules);
     Inference {
         title,
         command,
@@ -86,7 +196,7 @@ fn tokenize(command: &str) -> Vec<String> {
         .collect()
 }
 
-fn infer_category(tokens: &[String]) -> String {
+fn infer_category(tokens: &[String], rules: &InferenceRules) -> String {
     let first = tokens.first().map(|s| s.as_str()).unwrap_or("");
     let second = tokens.get(1).map(|s| s.as_str()).unwrap_or("");
     let key = match (first, second) {
@@ -94,6 +204,17 @@ fn infer_category(tokens: &[String]) -> String {
         ("git", "lfs") => "git",
         _ => first,
     };
+
+    // User overrides take precedence — checked under the combo key first
+    // (so "docker-compose" → user's choice) then the bare first token.
+    if let Some(cat) = rules.category_map.get(key) {
+        return cat.clone();
+    }
+    if key != first {
+        if let Some(cat) = rules.category_map.get(first) {
+            return cat.clone();
+        }
+    }
 
     let cat = match key {
         // Git
@@ -137,7 +258,7 @@ fn infer_category(tokens: &[String]) -> String {
     cat.to_string()
 }
 
-fn infer_tags(tokens: &[String], command: &str) -> Vec<String> {
+fn infer_tags(tokens: &[String], command: &str, rules: &InferenceRules) -> Vec<String> {
     let mut tags: Vec<String> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
 
@@ -148,9 +269,14 @@ fn infer_tags(tokens: &[String], command: &str) -> Vec<String> {
         }
     };
 
-    // Rule 1: tool name
+    // Rule 1: tool name (built-in whitelist + user extensions)
     if let Some(first) = tokens.first() {
-        if KNOWN_TOOLS.contains(&first.as_str()) {
+        let in_builtin = KNOWN_TOOLS.contains(&first.as_str());
+        let in_user = rules
+            .tool_tags
+            .iter()
+            .any(|t| t.eq_ignore_ascii_case(first));
+        if in_builtin || in_user {
             push(first, &mut tags, &mut seen);
         }
     }
@@ -163,9 +289,11 @@ fn infer_tags(tokens: &[String], command: &str) -> Vec<String> {
         }
     }
 
-    // Rule 2: action verbs
+    // Rule 2: action verbs — user override first, built-in fallback.
     for tok in tokens.iter().take(6) {
-        if let Some(action) = VERB_TAGS.iter().find(|(k, _)| *k == tok.as_str()) {
+        if let Some(action) = rules.verb_tags.get(tok.as_str()) {
+            push(action, &mut tags, &mut seen);
+        } else if let Some(action) = VERB_TAGS.iter().find(|(k, _)| *k == tok.as_str()) {
             push(action.1, &mut tags, &mut seen);
         }
     }
@@ -429,6 +557,92 @@ mod tests {
     fn strips_caret_prompt_too() {
         let r = infer("> ls -la");
         assert_eq!(r.command, "ls -la");
+    }
+
+    #[test]
+    fn user_category_override_wins_over_default() {
+        let mut rules = InferenceRules::default();
+        rules.category_map.insert("terraform".into(), "Infra".into());
+        let r = infer_with("terraform plan -out=tfplan", &rules);
+        assert_eq!(r.category, "Infra");
+    }
+
+    #[test]
+    fn user_category_override_takes_precedence_over_builtin() {
+        let mut rules = InferenceRules::default();
+        // Built-in maps `git` → "Git"; user remaps to "VersionControl"
+        rules.category_map.insert("git".into(), "VersionControl".into());
+        let r = infer_with("git log --oneline", &rules);
+        assert_eq!(r.category, "VersionControl");
+    }
+
+    #[test]
+    fn user_category_override_uses_combo_key_when_present() {
+        let mut rules = InferenceRules::default();
+        rules.category_map.insert("docker-compose".into(), "Stack".into());
+        let r = infer_with("docker compose up -d", &rules);
+        assert_eq!(r.category, "Stack");
+    }
+
+    #[test]
+    fn user_tool_tag_extends_whitelist() {
+        let mut rules = InferenceRules::default();
+        rules.tool_tags.push("terraform".into());
+        let r = infer_with("terraform plan", &rules);
+        assert!(r.tags.contains(&"terraform".to_string()));
+    }
+
+    #[test]
+    fn user_verb_tag_takes_precedence() {
+        let mut rules = InferenceRules::default();
+        rules.verb_tags.insert("plan".into(), "preview".into());
+        let r = infer_with("terraform plan", &rules);
+        assert!(r.tags.contains(&"preview".to_string()));
+    }
+
+    #[test]
+    fn user_verb_tag_overrides_builtin() {
+        // Use a verb that has a built-in mapping but isn't ALSO matched by a
+        // subcommand combo (Rule 3) — otherwise the subcommand rule
+        // independently re-adds the old tag. "restart" → "restart" qualifies.
+        let mut rules = InferenceRules::default();
+        rules.verb_tags.insert("restart".into(), "bounce".into());
+        let r = infer_with("systemctl restart nginx", &rules);
+        assert!(r.tags.contains(&"bounce".to_string()));
+        assert!(!r.tags.contains(&"restart".to_string()));
+    }
+
+    #[test]
+    fn empty_rules_match_default_behavior() {
+        let rules = InferenceRules::default();
+        let with = infer_with("docker container prune -f", &rules);
+        let default = infer("docker container prune -f");
+        assert_eq!(with.category, default.category);
+        assert_eq!(with.tags, default.tags);
+    }
+
+    #[test]
+    fn rules_load_parses_prd_sample() {
+        let sample = r#"
+        {
+            "category_map": { "terraform": "Infra", "ansible": "Infra" },
+            "tool_tags": ["terraform", "ansible", "vault"],
+            "verb_tags": { "plan": "preview", "apply": "deploy" }
+        }
+        "#;
+        let parsed: InferenceRules = serde_json::from_str(sample).unwrap();
+        assert_eq!(parsed.category_map.get("terraform").map(|s| s.as_str()), Some("Infra"));
+        assert_eq!(parsed.tool_tags.len(), 3);
+        assert_eq!(parsed.verb_tags.get("plan").map(|s| s.as_str()), Some("preview"));
+    }
+
+    #[test]
+    fn rules_load_tolerates_partial_files() {
+        let only_tools = r#"{ "tool_tags": ["pulumi"] }"#;
+        let parsed: InferenceRules = serde_json::from_str(only_tools).unwrap();
+        assert_eq!(parsed.tool_tags, vec!["pulumi"]);
+        assert!(parsed.category_map.is_empty());
+        assert!(parsed.verb_tags.is_empty());
     }
 
     #[test]

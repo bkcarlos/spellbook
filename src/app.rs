@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use crate::db::Db;
 use crate::inference;
-use crate::llm::{EnhanceTrigger, JobKind, JobOutput, JobResult, LlmConfig, LlmManager, Provider};
+use crate::llm::{EnhanceTrigger, JobKind, JobOutput, JobResult, LlmConfig, LlmManager, Provider, RequestPreview};
 use crate::models::{Category, CommandNote, ExportBundle};
 use crate::search::SearchEngine;
 use crate::installer::{detect_install_kind, restart_mac_app, InstallKind, InstallState, Installer};
@@ -15,6 +15,14 @@ use crate::update::UpdateChecker;
 
 #[allow(dead_code)]
 const APP_NAME: &str = "📚 Spellbook";
+
+/// Stable Id for the top-bar search TextEdit. Used by the shortcut handler
+/// to decide whether ↑/↓/Enter should drive list navigation: yes when this
+/// widget is focused (Raycast-style), no when any *other* TextEdit owns
+/// focus (so editing in the detail pane doesn't jump the selection).
+fn search_widget_id() -> egui::Id {
+    egui::Id::new("spellbook_global_search")
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
 pub enum View {
@@ -86,6 +94,22 @@ pub struct App {
     update_checker: UpdateChecker,
     installer: Installer,
     install_kind: Option<InstallKind>,
+    find_in_view: Option<FindInView>,
+    payload_preview: Option<RequestPreview>,
+}
+
+/// State for the Cmd+F find-in-view bar. Active only when the right detail
+/// pane has a command selected. Matches the description's text (markdown
+/// source); switches rendering to plain text with highlights while open.
+#[derive(Default)]
+struct FindInView {
+    query: String,
+    /// Index of the "current" match, wraps with Enter / Shift+Enter.
+    current: usize,
+    /// Recomputed each frame from the current description.
+    total: usize,
+    /// True for one frame after Cmd+F so the input grabs focus.
+    focus: bool,
 }
 
 #[derive(Default)]
@@ -217,6 +241,8 @@ impl App {
             update_checker: UpdateChecker::new(),
             installer: Installer::new(),
             install_kind: detect_install_kind(),
+            find_in_view: None,
+            payload_preview: None,
         };
         app.reload();
         app
@@ -374,6 +400,9 @@ impl App {
         if buffer_id != self.selected_command_id {
             self.flush_edit_buffer();
             self.load_edit_buffer();
+            // A different command — kill the find bar so it doesn't show
+            // stale match counts from the previous note.
+            self.find_in_view = None;
         }
     }
 
@@ -772,6 +801,7 @@ impl eframe::App for App {
         self.draw_fill_params(ctx);
         self.draw_shortcuts(ctx);
         self.draw_about(ctx);
+        self.draw_payload_preview(ctx);
         self.draw_toast(ctx);
 
         // expire toast
@@ -792,7 +822,7 @@ impl eframe::App for App {
 
 impl App {
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
-        let (cmd_n, cmd_k, cmd_shift_c, cmd_d, esc, cmd_e, cmd_i) = ctx.input(|i| {
+        let (cmd_n, cmd_k, cmd_shift_c, cmd_d, esc, cmd_e, cmd_i, cmd_f) = ctx.input(|i| {
             (
                 i.key_pressed(Key::N) && i.modifiers.command,
                 i.key_pressed(Key::K) && i.modifiers.command,
@@ -801,6 +831,7 @@ impl App {
                 i.key_pressed(Key::Escape),
                 i.key_pressed(Key::E) && i.modifiers.command,
                 i.key_pressed(Key::I) && i.modifiers.command,
+                i.key_pressed(Key::F) && i.modifiers.command && !i.modifiers.shift,
             )
         });
 
@@ -828,6 +859,12 @@ impl App {
         if cmd_i && self.nl_gen.is_none() && self.quick_add.is_none() {
             self.nl_gen = Some(NlGenState::default());
         }
+        if cmd_f && self.selected_command_id.is_some() && self.quick_add.is_none() {
+            match self.find_in_view.as_mut() {
+                Some(f) => f.focus = true,
+                None => self.find_in_view = Some(FindInView { focus: true, ..Default::default() }),
+            }
+        }
 
         // List navigation (↑↓ Enter). Only active when no modal is open
         // (modals would absorb the keys anyway, but we guard explicitly).
@@ -840,8 +877,19 @@ impl App {
             || self.show_import
             || self.show_shortcuts
             || self.show_about
-            || self.fill_params.is_some();
-        if !modal_open {
+            || self.fill_params.is_some()
+            || self.payload_preview.is_some();
+
+        // If another TextEdit (detail title / command / description / tags /
+        // find bar) owns focus, ↑/↓/Enter belong to it — don't move the
+        // command list selection out from under the user. The search box is
+        // the deliberate exception (Raycast-style: type, then ↓ to pick).
+        let typing_elsewhere = ctx
+            .memory(|m| m.focused())
+            .map(|id| id != search_widget_id())
+            .unwrap_or(false);
+
+        if !modal_open && !typing_elsewhere {
             let (up, down, enter) = ctx.input(|i| {
                 (
                     i.key_pressed(Key::ArrowDown),
@@ -891,7 +939,9 @@ impl App {
         }
 
         if esc {
-            if self.fill_params.is_some() {
+            if self.payload_preview.is_some() {
+                self.payload_preview = None;
+            } else if self.fill_params.is_some() {
                 self.fill_params = None;
             } else if self.show_about {
                 self.show_about = false;
@@ -912,6 +962,8 @@ impl App {
                 self.confirm_delete = None;
             } else if self.show_import {
                 self.show_import = false;
+            } else if self.find_in_view.is_some() {
+                self.find_in_view = None;
             } else if !self.search.is_empty() {
                 self.search.clear();
             }
@@ -968,6 +1020,7 @@ impl App {
                 let search_resp = ui.add_sized(
                     [ui.available_width() - 480.0, 24.0],
                     TextEdit::singleline(&mut self.search)
+                        .id(search_widget_id())
                         .hint_text("🔍  搜索  (Ctrl/Cmd+K)"),
                 );
                 if self.pending_focus.search {
@@ -1038,13 +1091,49 @@ impl App {
                 });
                 ui.add_space(2.0);
 
+                let mut reorder: Option<(i64, i64, bool)> = None; // (dragged, target, drop_above_midline)
                 ScrollArea::vertical().show(ui, |ui| {
                     let cats = self.categories.clone();
                     for cat in &cats {
                         let count = self.category_counts.get(&cat.id).copied().unwrap_or(0) as usize;
-                        self.sidebar_entry(ui, View::Category(cat.id), &cat.name, count);
+                        let frame = egui::Frame::none()
+                            .inner_margin(egui::Margin::symmetric(0.0, 1.0));
+                        let drag_id = egui::Id::new(("cat_drag", cat.id));
+                        let (inner, payload) =
+                            ui.dnd_drop_zone::<i64, _>(frame, |ui| {
+                                ui.dnd_drag_source(drag_id, cat.id, |ui| {
+                                    self.sidebar_entry(ui, View::Category(cat.id), &cat.name, count);
+                                });
+                            });
+                        if let Some(dropped_arc) = payload {
+                            let dropped_id = *dropped_arc;
+                            if dropped_id != cat.id {
+                                let mid_y = inner.response.rect.center().y;
+                                let above = ui
+                                    .ctx()
+                                    .pointer_interact_pos()
+                                    .map(|p| p.y < mid_y)
+                                    .unwrap_or(true);
+                                reorder = Some((dropped_id, cat.id, above));
+                            }
+                        }
                     }
                 });
+
+                if let Some((src, tgt, above)) = reorder {
+                    let mut order: Vec<i64> =
+                        self.categories.iter().map(|c| c.id).collect();
+                    order.retain(|&id| id != src);
+                    let tgt_pos = order.iter().position(|&id| id == tgt).unwrap_or(order.len());
+                    let insert_at = if above { tgt_pos } else { tgt_pos + 1 };
+                    let insert_at = insert_at.min(order.len());
+                    order.insert(insert_at, src);
+                    if let Err(e) = self.db.set_category_order(&order) {
+                        self.toast_error(format!("调整顺序失败: {e}"));
+                    } else {
+                        self.reload();
+                    }
+                }
             });
     }
 
@@ -1099,12 +1188,219 @@ impl App {
 
                 let cmd_id = self.edit_buffer.as_ref().unwrap().command_id;
                 let trashed = self.is_trashed(cmd_id);
+                self.draw_find_bar(ui);
                 if trashed {
                     self.draw_detail_trash_view(ui, cmd_id);
                 } else {
                     self.draw_detail_edit_view(ui, cmd_id);
                 }
             });
+    }
+
+    /// Render markdown with a 📋 copy button on every fenced code block.
+    /// Non-code text segments go through `CommonMarkViewer`; fenced blocks
+    /// are drawn as a custom monospace box with one-click copy. Solves the
+    /// "this entry's description has 3 sub-commands" case without changing
+    /// the data model.
+    ///
+    /// While the Cmd+F find bar is active with a non-empty query, switches
+    /// to a plain-text highlighted view so matches are visible (egui_commonmark
+    /// 0.18 has no hook to overlay highlights on rendered markdown).
+    fn render_markdown_with_code_copy(&mut self, ui: &mut Ui, md: &str) {
+        let find_query = self
+            .find_in_view
+            .as_ref()
+            .map(|f| f.query.clone())
+            .filter(|q| !q.is_empty());
+        if let Some(q) = find_query {
+            self.render_text_with_highlights(ui, md, &q);
+            return;
+        }
+        for seg in split_fenced_code(md) {
+            match seg {
+                MdSegment::Text(s) if s.trim().is_empty() => {}
+                MdSegment::Text(s) => {
+                    CommonMarkViewer::new().show(ui, &mut self.md_cache, &s);
+                }
+                MdSegment::Code { lang, body } => {
+                    self.draw_copyable_code_block(ui, &lang, &body);
+                }
+            }
+        }
+    }
+
+    /// Render `text` as a monospace block with every case-insensitive
+    /// match of `query` highlighted. Updates `find_in_view.total` and
+    /// gives the "current" match a brighter background so the user can
+    /// see which one [Next] / [Prev] is pointing at.
+    fn render_text_with_highlights(&mut self, ui: &mut Ui, text: &str, query: &str) {
+        use egui::text::{LayoutJob, TextFormat};
+
+        let matches = find_matches(text, query);
+        let total = matches.len();
+
+        if let Some(f) = self.find_in_view.as_mut() {
+            f.total = total;
+            if total > 0 {
+                f.current %= total;
+            } else {
+                f.current = 0;
+            }
+        }
+        let current_idx = self.find_in_view.as_ref().map(|f| f.current).unwrap_or(0);
+
+        let mut job = LayoutJob::default();
+        let body = TextFormat {
+            font_id: egui::FontId::monospace(13.0),
+            color: ui.visuals().text_color(),
+            ..Default::default()
+        };
+        let hit = TextFormat {
+            font_id: egui::FontId::monospace(13.0),
+            color: Color32::BLACK,
+            background: Color32::from_rgb(255, 230, 100),
+            ..Default::default()
+        };
+        let hit_current = TextFormat {
+            font_id: egui::FontId::monospace(13.0),
+            color: Color32::BLACK,
+            background: Color32::from_rgb(255, 160, 60),
+            ..Default::default()
+        };
+
+        let mut cursor = 0usize;
+        for (i, (start, end)) in matches.iter().enumerate() {
+            if *start > cursor {
+                job.append(&text[cursor..*start], 0.0, body.clone());
+            }
+            let fmt = if i == current_idx { hit_current.clone() } else { hit.clone() };
+            job.append(&text[*start..*end], 0.0, fmt);
+            cursor = *end;
+        }
+        if cursor < text.len() {
+            job.append(&text[cursor..], 0.0, body);
+        }
+
+        ui.add(egui::Label::new(job).wrap());
+    }
+
+    /// Find bar — fixed strip at the top of the right detail pane, only
+    /// visible while `find_in_view` is `Some`. Owns its text input,
+    /// match counter, and prev/next/close affordances.
+    fn draw_find_bar(&mut self, ui: &mut Ui) {
+        if self.find_in_view.is_none() {
+            return;
+        }
+        let (total, current_plus_one) = {
+            let f = self.find_in_view.as_ref().unwrap();
+            (f.total, if f.total == 0 { 0 } else { f.current + 1 })
+        };
+
+        let mut close = false;
+        let mut next = false;
+        let mut prev = false;
+
+        egui::Frame::group(ui.style())
+            .inner_margin(egui::Margin::symmetric(6.0, 4.0))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("🔎 在说明中查找").small().weak());
+                    let resp = {
+                        let f = self.find_in_view.as_mut().unwrap();
+                        let r = ui.add(
+                            TextEdit::singleline(&mut f.query)
+                                .hint_text("输入要查找的文字")
+                                .desired_width(180.0),
+                        );
+                        if f.focus {
+                            r.request_focus();
+                            f.focus = false;
+                        }
+                        r
+                    };
+
+                    let counter = if total == 0 {
+                        if self.find_in_view.as_ref().unwrap().query.is_empty() {
+                            "—".to_string()
+                        } else {
+                            "0 / 0".to_string()
+                        }
+                    } else {
+                        format!("{current_plus_one} / {total}")
+                    };
+                    ui.label(RichText::new(counter).small().weak());
+
+                    if ui.small_button("◀").on_hover_text("上一个 (Shift+Enter)").clicked() {
+                        prev = true;
+                    }
+                    if ui.small_button("▶").on_hover_text("下一个 (Enter)").clicked() {
+                        next = true;
+                    }
+                    if ui.small_button("✕").on_hover_text("关闭 (Esc)").clicked() {
+                        close = true;
+                    }
+
+                    // Enter / Shift+Enter inside the query input cycle matches.
+                    if resp.has_focus() {
+                        ui.input(|i| {
+                            if i.key_pressed(Key::Enter) {
+                                if i.modifiers.shift {
+                                    prev = true;
+                                } else {
+                                    next = true;
+                                }
+                            }
+                        });
+                    }
+                });
+            });
+
+        if close {
+            self.find_in_view = None;
+        } else if let Some(f) = self.find_in_view.as_mut() {
+            if total > 0 {
+                if next {
+                    f.current = (f.current + 1) % total;
+                } else if prev {
+                    f.current = if f.current == 0 { total - 1 } else { f.current - 1 };
+                }
+            }
+        }
+    }
+
+    fn draw_copyable_code_block(&mut self, ui: &mut Ui, lang: &str, body: &str) {
+        let mut copy_clicked = false;
+        egui::Frame::group(ui.style())
+            .fill(ui.visuals().extreme_bg_color)
+            .inner_margin(egui::Margin::same(8.0))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let label = if lang.is_empty() { "code" } else { lang };
+                    ui.label(RichText::new(label).small().weak());
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui
+                            .small_button("📋")
+                            .on_hover_text("复制此段")
+                            .clicked()
+                        {
+                            copy_clicked = true;
+                        }
+                    });
+                });
+                ui.add_space(2.0);
+                let mut owned = body.to_string();
+                let rows = body.lines().count().max(1).min(20);
+                ui.add(
+                    TextEdit::multiline(&mut owned)
+                        .font(egui::TextStyle::Monospace)
+                        .desired_width(f32::INFINITY)
+                        .desired_rows(rows)
+                        .interactive(false),
+                );
+            });
+        if copy_clicked {
+            self.copy_to_clipboard(body);
+        }
     }
 
     /// Inline editor for an active command (auto-saves every 500ms after last edit).
@@ -1296,6 +1592,18 @@ impl App {
                     self.flush_edit_buffer();
                     self.llm.explain(&command, cmd_id);
                 }
+                if ui
+                    .small_button("👁")
+                    .on_hover_text("查看本次 AI 解释会发送的内容")
+                    .clicked()
+                {
+                    let command = self
+                        .edit_buffer
+                        .as_ref()
+                        .map(|b| b.command.clone())
+                        .unwrap_or_default();
+                    self.payload_preview = Some(self.llm.preview_explain(&command));
+                }
             }
             if ui
                 .button(RichText::new("🗑 删除").color(Color32::from_rgb(200, 80, 80)))
@@ -1333,6 +1641,18 @@ impl App {
                         }
                         self.llm.generate_description(&title, &command, Some(cmd_id));
                     }
+                    if ui
+                        .small_button("👁")
+                        .on_hover_text("查看本次生成 description 会发送的内容")
+                        .clicked()
+                    {
+                        let (title, command) = {
+                            let b = self.edit_buffer.as_ref().unwrap();
+                            (b.title.clone(), b.command.clone())
+                        };
+                        self.payload_preview =
+                            Some(self.llm.preview_describe(&title, &command));
+                    }
                 }
                 let toggle_label = if desc_editing { "👁 预览" } else { "✎ 编辑" };
                 if ui.small_button(toggle_label).clicked() {
@@ -1363,7 +1683,7 @@ impl App {
                 .id_salt("desc_scroll")
                 .auto_shrink([false; 2])
                 .show(ui, |ui| {
-                    CommonMarkViewer::new().show(ui, &mut self.md_cache, &description);
+                    self.render_markdown_with_code_copy(ui, &description);
                 });
         } else {
             ui.label(RichText::new("（无说明，点上方 ✎ 编辑 或 ✨ AI 生成）").weak());
@@ -1442,7 +1762,7 @@ impl App {
             ScrollArea::vertical()
                 .id_salt("trash_desc")
                 .show(ui, |ui| {
-                    CommonMarkViewer::new().show(ui, &mut self.md_cache, &description);
+                    self.render_markdown_with_code_copy(ui, &description);
                 });
         }
     }
@@ -1579,6 +1899,7 @@ impl App {
         let mut keep_open = true;
         let mut close_requested = false;
         let mut do_save = false;
+        let mut ask_preview = false;
 
         egui::Window::new("✨ 新建命令")
             .open(&mut keep_open)
@@ -1664,28 +1985,41 @@ impl App {
                     }
                 }
 
-                // AI status badge
-                match st.enhance_status {
-                    EnhanceStatus::Pending => {
-                        ui.label(
-                            RichText::new("🧠 AI 增强中…（不影响保存）")
-                                .color(Color32::from_rgb(120, 180, 240)),
-                        );
+                // AI status badge + "👁 查看将发送" toggle
+                ui.horizontal(|ui| {
+                    match st.enhance_status {
+                        EnhanceStatus::Pending => {
+                            ui.label(
+                                RichText::new("🧠 AI 增强中…（不影响保存）")
+                                    .color(Color32::from_rgb(120, 180, 240)),
+                            );
+                        }
+                        EnhanceStatus::Done => {
+                            ui.label(
+                                RichText::new("🧠 AI 已增强")
+                                    .color(Color32::from_rgb(140, 200, 140)),
+                            );
+                        }
+                        EnhanceStatus::Failed => {
+                            ui.label(
+                                RichText::new("⚠ AI 增强失败，已回退到规则结果")
+                                    .color(Color32::from_rgb(200, 140, 60)),
+                            );
+                        }
+                        EnhanceStatus::Idle => {}
                     }
-                    EnhanceStatus::Done => {
-                        ui.label(
-                            RichText::new("🧠 AI 已增强")
-                                .color(Color32::from_rgb(140, 200, 140)),
-                        );
+                    if !st.command.trim().is_empty() {
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if ui
+                                .small_button("👁 查看将发送")
+                                .on_hover_text("查看本次粘贴即增强会发送给 AI 的完整内容")
+                                .clicked()
+                            {
+                                ask_preview = true;
+                            }
+                        });
                     }
-                    EnhanceStatus::Failed => {
-                        ui.label(
-                            RichText::new("⚠ AI 增强失败，已回退到规则结果")
-                                .color(Color32::from_rgb(200, 140, 60)),
-                        );
-                    }
-                    EnhanceStatus::Idle => {}
-                }
+                });
 
                 if let Some(dup_id) = st.duplicate_id {
                     ui.horizontal(|ui| {
@@ -1810,6 +2144,15 @@ impl App {
                     do_save = true;
                 }
             });
+
+        if ask_preview {
+            self.payload_preview = Some(self.llm.preview_enhance(
+                &st.command,
+                &st.title,
+                &st.category_name,
+                &st.tags,
+            ));
+        }
 
         if do_save {
             self.quick_add = Some(st);
@@ -2226,6 +2569,109 @@ impl App {
         }
     }
 
+    // ---------- AI payload preview ----------
+
+    /// Modal: show the exact HTTP request that would be sent to the LLM
+    /// provider for the current AI action. Renders provider, URL, headers
+    /// (auth value replaced by a placeholder naming the env var / Keychain
+    /// entry the key would come from), and pretty-printed JSON body.
+    fn draw_payload_preview(&mut self, ctx: &egui::Context) {
+        let Some(preview) = self.payload_preview.clone() else {
+            return;
+        };
+        let mut open = true;
+        let mut close = false;
+        let mut copy_all = false;
+
+        egui::Window::new("🔎 本次将发送给 AI 的内容")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_width(680.0)
+            .default_height(560.0)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(RichText::new(&preview.feature_label).weak());
+                ui.add_space(4.0);
+
+                if let Some(note) = &preview.would_skip {
+                    ui.label(
+                        RichText::new(format!("⚠ {note}")).color(Color32::from_rgb(220, 160, 60)),
+                    );
+                    ui.add_space(2.0);
+                }
+
+                egui::Grid::new("payload_meta")
+                    .num_columns(2)
+                    .spacing([12.0, 4.0])
+                    .show(ui, |ui| {
+                        ui.label(RichText::new("Provider").weak());
+                        ui.label(&preview.provider_label);
+                        ui.end_row();
+
+                        ui.label(RichText::new("URL").weak());
+                        ui.label(RichText::new(&preview.url).monospace());
+                        ui.end_row();
+                    });
+
+                ui.add_space(6.0);
+                ui.label(RichText::new("Headers").weak());
+                egui::Frame::group(ui.style()).inner_margin(egui::Margin::same(6.0)).show(ui, |ui| {
+                    for (k, v) in &preview.headers {
+                        ui.label(RichText::new(format!("{k}: {v}")).monospace().small());
+                    }
+                });
+
+                ui.add_space(8.0);
+                ui.label(RichText::new("Body").weak());
+                let body_height = (ui.available_height() - 80.0).max(120.0);
+                ScrollArea::vertical()
+                    .id_salt("payload_body")
+                    .max_height(body_height)
+                    .show(ui, |ui| {
+                        let mut body_owned = preview.body_json.clone();
+                        let rows = body_owned.lines().count().max(6);
+                        ui.add(
+                            TextEdit::multiline(&mut body_owned)
+                                .font(egui::TextStyle::Monospace)
+                                .desired_width(f32::INFINITY)
+                                .desired_rows(rows)
+                                .interactive(false),
+                        );
+                    });
+
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("📋 复制完整 payload").clicked() {
+                        copy_all = true;
+                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.button("我了解，关闭 (Esc)").clicked() {
+                            close = true;
+                        }
+                    });
+                });
+            });
+
+        if copy_all {
+            let p = &preview;
+            let headers: String = p
+                .headers
+                .iter()
+                .map(|(k, v)| format!("{k}: {v}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let dump = format!(
+                "Provider: {}\nURL: {}\n\nHeaders:\n{}\n\nBody:\n{}",
+                p.provider_label, p.url, headers, p.body_json
+            );
+            self.copy_to_clipboard(&dump);
+        }
+        if close || !open {
+            self.payload_preview = None;
+        }
+    }
+
     // ---------- shortcut help ----------
 
     fn draw_shortcuts(&mut self, ctx: &egui::Context) {
@@ -2242,6 +2688,7 @@ impl App {
                 let rows = [
                     ("Ctrl/Cmd + K", "聚焦搜索框"),
                     ("Ctrl/Cmd + N", "极速新建（自动粘贴剪贴板）"),
+                    ("Ctrl/Cmd + F", "在当前命令的说明中查找文字"),
                     ("Ctrl/Cmd + I", "AI 自然语言生成命令"),
                     ("Ctrl/Cmd + E", "编辑当前命令"),
                     ("Ctrl/Cmd + S", "保存编辑"),
@@ -2250,7 +2697,7 @@ impl App {
                     ("↑ / ↓", "在命令列表里上下移动"),
                     ("Enter", "复制当前选中命令（回收站中则还原）"),
                     ("Delete", "（在详情区）删除"),
-                    ("Esc", "关闭弹窗 / 清空搜索"),
+                    ("Esc", "关闭弹窗 / 清空搜索 / 关闭查找"),
                     ("? 或 F1", "显示本面板"),
                 ];
                 egui::Grid::new("shortcut_grid")
@@ -2546,6 +2993,7 @@ impl App {
         let mut keep_open = true;
         let mut close_requested = false;
         let mut do_generate = false;
+        let mut ask_preview = false;
 
         egui::Window::new("🪄 AI 生成命令")
             .open(&mut keep_open)
@@ -2592,11 +3040,25 @@ impl App {
                     {
                         do_generate = true;
                     }
+                    if ui
+                        .add_enabled(
+                            !st.prompt.trim().is_empty(),
+                            egui::Button::new("👁 查看将发送").small(),
+                        )
+                        .on_hover_text("查看本次会发送给 AI 的完整内容")
+                        .clicked()
+                    {
+                        ask_preview = true;
+                    }
                     if ui.button("取消 (Esc)").clicked() {
                         close_requested = true;
                     }
                 });
             });
+
+        if ask_preview {
+            self.payload_preview = Some(self.llm.preview_generate(&st.prompt));
+        }
 
         if do_generate {
             st.in_flight = true;
@@ -2807,6 +3269,35 @@ impl App {
                         .weak()
                         .small(),
                 );
+
+                ui.add_space(6.0);
+                ui.separator();
+                ui.add_space(4.0);
+                ui.label(RichText::new("自定义推断规则").strong());
+                let status = inference::rules_status();
+                let (msg, color) = match &status {
+                    inference::RulesStatus::Absent => (
+                        format!(
+                            "未配置 — 可创建 {} 来覆盖内置 category / tool / verb 映射（重启生效）",
+                            inference::InferenceRules::config_path()
+                                .map(|p| p.display().to_string())
+                                .unwrap_or_else(|| "~/.config/Spellbook/inference_rules.json".into())
+                        ),
+                        Color32::from_rgb(160, 160, 170),
+                    ),
+                    inference::RulesStatus::Loaded { path, categories, tools, verbs } => (
+                        format!(
+                            "✓ 已加载 {} （分类 {categories} 项、工具 {tools} 项、动词 {verbs} 项）",
+                            path.display()
+                        ),
+                        Color32::from_rgb(140, 200, 140),
+                    ),
+                    inference::RulesStatus::ParseError { path, error } => (
+                        format!("⚠ {} 解析失败,沿用内置规则: {error}", path.display()),
+                        Color32::from_rgb(220, 160, 60),
+                    ),
+                };
+                ui.label(RichText::new(msg).small().color(color));
             });
 
         if do_test {
@@ -3112,5 +3603,262 @@ fn tag_chip(ui: &mut Ui, tag: &str, removable: bool, compact: bool) -> TagChipRe
     TagChipResponse {
         response,
         remove_clicked: inner.inner,
+    }
+}
+
+// ============================================================================
+// Find-in-text helper
+// ============================================================================
+
+/// Case-insensitive substring search. Returns (start_byte, end_byte) for each
+/// non-overlapping match in `haystack`. Empty needle → no matches (avoid
+/// infinite loop in caller).
+///
+/// Byte indices come from the original `haystack`, not the lowercased copy.
+/// This is byte-safe when `to_lowercase()` doesn't change byte counts, which
+/// is true for ASCII + CJK content (the realistic case). For exotic Unicode
+/// (Turkish `İ` → `i̇` etc.) the alignment may drift; we accept that as we
+/// only use the result for highlight ranges, not for editing.
+fn find_matches(haystack: &str, needle: &str) -> Vec<(usize, usize)> {
+    let needle = needle.trim();
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    let needle_lower = needle.to_lowercase();
+    let haystack_lower = haystack.to_lowercase();
+    let nlen = needle_lower.len();
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    while let Some(rel) = haystack_lower[start..].find(&needle_lower) {
+        let abs = start + rel;
+        let end = abs + nlen;
+        // Make sure (abs, end) lie on char boundaries of the original
+        // haystack — if not, skip ahead by one char to recover safely.
+        if haystack.is_char_boundary(abs) && haystack.is_char_boundary(end) {
+            out.push((abs, end));
+            start = end;
+        } else {
+            // advance by one char to escape unaligned position
+            let next = haystack[abs..]
+                .char_indices()
+                .nth(1)
+                .map(|(i, _)| abs + i)
+                .unwrap_or(haystack.len());
+            start = next;
+        }
+        if start >= haystack.len() {
+            break;
+        }
+    }
+    out
+}
+
+// ============================================================================
+// Markdown fence splitter
+// ============================================================================
+
+#[derive(Debug, PartialEq, Eq)]
+enum MdSegment {
+    Text(String),
+    Code { lang: String, body: String },
+}
+
+/// Split a markdown source into alternating text and fenced-code segments.
+/// A fence is a line starting with 3+ backticks; the close fence must have
+/// at least as many backticks as the open and no trailing info string.
+/// Unterminated fences (rare in real input) treat the remainder as code so
+/// nothing is silently dropped.
+fn split_fenced_code(md: &str) -> Vec<MdSegment> {
+    let mut out: Vec<MdSegment> = Vec::new();
+    let mut text_buf: Vec<&str> = Vec::new();
+    let mut code_buf: Vec<&str> = Vec::new();
+    let mut in_code = false;
+    let mut fence_len = 0usize;
+    let mut code_lang = String::new();
+
+    for line in md.lines() {
+        let trim = line.trim_start();
+        let ticks = trim.bytes().take_while(|&b| b == b'`').count();
+
+        if !in_code && ticks >= 3 {
+            if !text_buf.is_empty() {
+                out.push(MdSegment::Text(text_buf.join("\n")));
+                text_buf.clear();
+            }
+            fence_len = ticks;
+            code_lang = trim[ticks..].trim().to_string();
+            in_code = true;
+            continue;
+        }
+
+        if in_code && ticks >= fence_len && trim[ticks..].trim().is_empty() {
+            out.push(MdSegment::Code {
+                lang: std::mem::take(&mut code_lang),
+                body: code_buf.join("\n"),
+            });
+            code_buf.clear();
+            in_code = false;
+            fence_len = 0;
+            continue;
+        }
+
+        if in_code {
+            code_buf.push(line);
+        } else {
+            text_buf.push(line);
+        }
+    }
+
+    if in_code {
+        out.push(MdSegment::Code {
+            lang: code_lang,
+            body: code_buf.join("\n"),
+        });
+    } else if !text_buf.is_empty() {
+        out.push(MdSegment::Text(text_buf.join("\n")));
+    }
+
+    out
+}
+
+#[cfg(test)]
+mod md_tests {
+    use super::*;
+
+    #[test]
+    fn splits_text_and_code() {
+        let md = "before\n```bash\nls -la\n```\nafter";
+        let segs = split_fenced_code(md);
+        assert_eq!(segs.len(), 3);
+        assert_eq!(segs[0], MdSegment::Text("before".into()));
+        assert_eq!(
+            segs[1],
+            MdSegment::Code { lang: "bash".into(), body: "ls -la".into() }
+        );
+        assert_eq!(segs[2], MdSegment::Text("after".into()));
+    }
+
+    #[test]
+    fn handles_no_code() {
+        let segs = split_fenced_code("just plain markdown");
+        assert_eq!(segs, vec![MdSegment::Text("just plain markdown".into())]);
+    }
+
+    #[test]
+    fn handles_empty_input() {
+        assert!(split_fenced_code("").is_empty());
+    }
+
+    #[test]
+    fn handles_lang_with_dashes_and_no_lang() {
+        let md = "```\nfoo\n```\n\n```shell-session\nbar\n```";
+        let segs = split_fenced_code(md);
+        let codes: Vec<_> = segs
+            .iter()
+            .filter_map(|s| match s {
+                MdSegment::Code { lang, body } => Some((lang.clone(), body.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(codes.len(), 2);
+        assert_eq!(codes[0].0, "");
+        assert_eq!(codes[0].1, "foo");
+        assert_eq!(codes[1].0, "shell-session");
+        assert_eq!(codes[1].1, "bar");
+    }
+
+    #[test]
+    fn unterminated_fence_keeps_rest_as_code() {
+        let md = "intro\n```bash\nls\nps\n(no closing fence)";
+        let segs = split_fenced_code(md);
+        assert_eq!(segs.len(), 2);
+        assert!(matches!(segs[0], MdSegment::Text(_)));
+        match &segs[1] {
+            MdSegment::Code { lang, body } => {
+                assert_eq!(lang, "bash");
+                assert!(body.contains("ls"));
+                assert!(body.contains("ps"));
+                assert!(body.contains("(no closing fence)"));
+            }
+            _ => panic!("expected code"),
+        }
+    }
+
+    #[test]
+    fn multiple_code_blocks_each_kept_separate() {
+        let md = "# step 1\n```\nA\n```\n# step 2\n```\nB\n```";
+        let segs = split_fenced_code(md);
+        let codes: Vec<_> = segs
+            .iter()
+            .filter_map(|s| match s {
+                MdSegment::Code { body, .. } => Some(body.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(codes, vec!["A".to_string(), "B".to_string()]);
+    }
+
+    #[test]
+    fn close_fence_with_more_ticks_accepted() {
+        let md = "````\nweird\n````";
+        let segs = split_fenced_code(md);
+        assert_eq!(
+            segs,
+            vec![MdSegment::Code { lang: "".into(), body: "weird".into() }]
+        );
+    }
+
+    #[test]
+    fn inline_backticks_not_treated_as_fence() {
+        let md = "say `ls -la` to list";
+        let segs = split_fenced_code(md);
+        assert_eq!(segs, vec![MdSegment::Text("say `ls -la` to list".into())]);
+    }
+}
+
+#[cfg(test)]
+mod find_tests {
+    use super::find_matches;
+
+    #[test]
+    fn empty_needle_returns_nothing() {
+        assert!(find_matches("anything here", "").is_empty());
+        assert!(find_matches("anything", "   ").is_empty());
+    }
+
+    #[test]
+    fn finds_all_occurrences() {
+        let hits = find_matches("docker ps && docker ps -a", "docker");
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0], (0, 6));
+        assert_eq!(hits[1], (13, 19));
+    }
+
+    #[test]
+    fn case_insensitive() {
+        let hits = find_matches("Docker DOCKER docker", "docker");
+        assert_eq!(hits.len(), 3);
+    }
+
+    #[test]
+    fn non_overlapping_matches() {
+        let hits = find_matches("aaaa", "aa");
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0], (0, 2));
+        assert_eq!(hits[1], (2, 4));
+    }
+
+    #[test]
+    fn no_match_returns_empty() {
+        assert!(find_matches("hello world", "xyz").is_empty());
+    }
+
+    #[test]
+    fn cjk_content_finds_substring() {
+        let hits = find_matches("删除所有停止容器", "停止");
+        assert_eq!(hits.len(), 1);
+        // 删/除/所/有 = 4 chars × 3 bytes each = 12
+        assert_eq!(hits[0].0, 12);
+        assert_eq!(&"删除所有停止容器"[hits[0].0..hits[0].1], "停止");
     }
 }

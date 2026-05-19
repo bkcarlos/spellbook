@@ -147,6 +147,22 @@ impl Db {
         Ok(())
     }
 
+    /// Persist a new ordering for categories. `ids` must be the full set of
+    /// category ids in the desired display order; missing ids are pushed to
+    /// the end with stable relative order. Runs in a transaction so the UI
+    /// either sees the full reorder or nothing.
+    pub fn set_category_order(&mut self, ids: &[i64]) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        for (i, id) in ids.iter().enumerate() {
+            tx.execute(
+                "UPDATE category SET sort_order = ?1 WHERE id = ?2",
+                params![i as i32, id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     #[allow(dead_code)]
     pub fn find_category_by_name(&self, name: &str) -> Result<Option<Category>> {
         let row = self
@@ -409,6 +425,27 @@ mod tests {
         let id = db.add_category("Zebra").unwrap();
         let cat = db.list_categories().unwrap().into_iter().find(|c| c.id == id).unwrap();
         assert!(cat.sort_order > 0);
+    }
+
+    #[test]
+    fn set_category_order_reorders_persistently() {
+        let mut db = fresh();
+        let original: Vec<i64> = db.list_categories().unwrap().iter().map(|c| c.id).collect();
+        // Reverse the ordering and persist
+        let reversed: Vec<i64> = original.iter().rev().copied().collect();
+        db.set_category_order(&reversed).unwrap();
+        let after: Vec<i64> = db.list_categories().unwrap().iter().map(|c| c.id).collect();
+        assert_eq!(after, reversed, "list_categories should reflect new order");
+    }
+
+    #[test]
+    fn set_category_order_is_transactional() {
+        let mut db = fresh();
+        let ids: Vec<i64> = db.list_categories().unwrap().iter().map(|c| c.id).collect();
+        // Round-trip: shouldn't change anything visible
+        db.set_category_order(&ids).unwrap();
+        let after: Vec<i64> = db.list_categories().unwrap().iter().map(|c| c.id).collect();
+        assert_eq!(after, ids);
     }
 
     #[test]

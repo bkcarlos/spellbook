@@ -10,6 +10,7 @@ use crate::inference;
 use crate::llm::{EnhanceTrigger, JobKind, JobOutput, JobResult, LlmConfig, LlmManager, Provider};
 use crate::models::{Category, CommandNote, ExportBundle};
 use crate::search::SearchEngine;
+use crate::installer::{detect_install_kind, restart_mac_app, InstallKind, InstallState, Installer};
 use crate::update::UpdateChecker;
 
 #[allow(dead_code)]
@@ -83,6 +84,8 @@ pub struct App {
     show_about: bool,
     fill_params: Option<FillParamsState>,
     update_checker: UpdateChecker,
+    installer: Installer,
+    install_kind: Option<InstallKind>,
 }
 
 #[derive(Default)]
@@ -212,6 +215,8 @@ impl App {
             show_about: false,
             fill_params: None,
             update_checker: UpdateChecker::new(),
+            installer: Installer::new(),
+            install_kind: detect_install_kind(),
         };
         app.reload();
         app
@@ -743,6 +748,12 @@ impl eframe::App for App {
         // and debounced auto-save on changes.
         self.sync_edit_buffer();
         self.tick_autosave();
+
+        // Drain installer worker (download/install progress)
+        self.installer.poll();
+        if self.installer.busy() {
+            ctx.request_repaint_after(Duration::from_millis(200));
+        }
 
         self.handle_shortcuts(ctx);
 
@@ -1986,6 +1997,8 @@ impl App {
         let mut copy_cli = false;
         let mut copy_cask = false;
         let mut open_release = false;
+        let mut do_install: Option<String> = None;
+        let mut do_restart = false;
 
         let current = self.update_checker.current_version().to_string();
         let info = self.update_checker.update_info().cloned();
@@ -2026,31 +2039,101 @@ impl App {
                                 .strong(),
                         );
                         ui.add_space(6.0);
-                        ui.label(RichText::new("Homebrew 升级命令").small().weak());
-                        ui.horizontal(|ui| {
-                            ui.add(
-                                TextEdit::singleline(&mut "brew upgrade spellbook".to_string())
-                                    .font(egui::TextStyle::Monospace)
-                                    .desired_width(220.0)
-                                    .interactive(false),
-                            );
-                            if ui.small_button("📋 复制").clicked() {
-                                copy_cli = true;
+
+                        // Inline installer state — for /Applications/Spellbook.app users only.
+                        let install_kind = self.install_kind;
+                        let inst_state = self.installer.state().clone();
+                        let inst_busy = self.installer.busy();
+
+                        match (install_kind, &inst_state) {
+                            (Some(InstallKind::MacApp), InstallState::Idle | InstallState::Failed(_)) => {
+                                if let InstallState::Failed(err) = &inst_state {
+                                    ui.label(
+                                        RichText::new(format!("⚠ 上次安装失败: {err}"))
+                                            .color(Color32::from_rgb(200, 140, 60))
+                                            .small(),
+                                    );
+                                }
+                                if ui
+                                    .button(RichText::new("⬇ 下载并安装新版").strong())
+                                    .on_hover_text("下载 DMG → 替换 /Applications/Spellbook.app → 重启")
+                                    .clicked()
+                                {
+                                    do_install = Some(info.latest_version.clone());
+                                }
                             }
-                            ui.label(RichText::new("CLI").weak().small());
-                        });
-                        ui.horizontal(|ui| {
-                            ui.add(
-                                TextEdit::singleline(&mut "brew upgrade --cask spellbook".to_string())
-                                    .font(egui::TextStyle::Monospace)
-                                    .desired_width(220.0)
-                                    .interactive(false),
-                            );
-                            if ui.small_button("📋 复制").clicked() {
-                                copy_cask = true;
+                            (Some(InstallKind::MacApp), InstallState::Downloading { received, total }) => {
+                                let frac = if *total > 0 {
+                                    (*received as f32) / (*total as f32)
+                                } else {
+                                    0.0
+                                };
+                                ui.label(
+                                    RichText::new(format!(
+                                        "⬇ 下载中… {:.1} / {:.1} MB",
+                                        *received as f64 / 1_048_576.0,
+                                        (*total).max(*received) as f64 / 1_048_576.0
+                                    ))
+                                    .small(),
+                                );
+                                ui.add(egui::ProgressBar::new(frac).desired_width(280.0));
                             }
-                            ui.label(RichText::new(".app").weak().small());
-                        });
+                            (Some(InstallKind::MacApp), InstallState::Installing(status)) => {
+                                ui.label(
+                                    RichText::new(format!("⚙ {status}"))
+                                        .color(Color32::from_rgb(120, 180, 240))
+                                        .small(),
+                                );
+                                ui.add(egui::ProgressBar::new(0.95).desired_width(280.0));
+                            }
+                            (Some(InstallKind::MacApp), InstallState::Done) => {
+                                ui.label(
+                                    RichText::new("✓ 新版已就位")
+                                        .color(Color32::from_rgb(140, 200, 140))
+                                        .strong(),
+                                );
+                                if ui.button(RichText::new("🚀 立即重启").strong()).clicked() {
+                                    do_restart = true;
+                                }
+                            }
+                            (None, _) => {
+                                // Not a .app install — fall back to copy-command + browse
+                                ui.label(
+                                    RichText::new("（自动安装仅对 .app 版本可用；CLI 用户用下面命令）")
+                                        .weak()
+                                        .small(),
+                                );
+                                ui.horizontal(|ui| {
+                                    ui.add(
+                                        TextEdit::singleline(&mut "brew upgrade spellbook".to_string())
+                                            .font(egui::TextStyle::Monospace)
+                                            .desired_width(220.0)
+                                            .interactive(false),
+                                    );
+                                    if ui.small_button("📋 复制").clicked() {
+                                        copy_cli = true;
+                                    }
+                                    ui.label(RichText::new("CLI").weak().small());
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.add(
+                                        TextEdit::singleline(
+                                            &mut "brew upgrade --cask spellbook".to_string(),
+                                        )
+                                        .font(egui::TextStyle::Monospace)
+                                        .desired_width(220.0)
+                                        .interactive(false),
+                                    );
+                                    if ui.small_button("📋 复制").clicked() {
+                                        copy_cask = true;
+                                    }
+                                    ui.label(RichText::new(".app").weak().small());
+                                });
+                            }
+                        }
+
+                        let _ = inst_busy;
+
                         ui.add_space(6.0);
                         if ui
                             .button(RichText::new("🌐 打开 Release Notes"))
@@ -2128,6 +2211,14 @@ impl App {
                 if let Err(e) = open_url(&info.release_url) {
                     self.toast_error(format!("无法打开浏览器: {e}"));
                 }
+            }
+        }
+        if let Some(v) = do_install {
+            self.installer.start_mac(&v);
+        }
+        if do_restart {
+            if let Err(e) = restart_mac_app() {
+                self.toast_error(format!("重启失败: {e}"));
             }
         }
         if !open {

@@ -3,6 +3,7 @@
 mod app;
 mod db;
 mod inference;
+mod installer;
 mod llm;
 mod models;
 mod search;

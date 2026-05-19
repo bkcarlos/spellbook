@@ -10,6 +10,7 @@ use crate::inference;
 use crate::llm::{EnhanceTrigger, JobKind, JobOutput, JobResult, LlmConfig, LlmManager, Provider};
 use crate::models::{Category, CommandNote, ExportBundle};
 use crate::search::SearchEngine;
+use crate::update::UpdateChecker;
 
 #[allow(dead_code)]
 const APP_NAME: &str = "📚 Spellbook";
@@ -77,7 +78,9 @@ pub struct App {
     // recycle bin + undo
     last_deleted: Option<i64>,
     show_shortcuts: bool,
+    show_about: bool,
     fill_params: Option<FillParamsState>,
+    update_checker: UpdateChecker,
 }
 
 #[derive(Default)]
@@ -202,7 +205,9 @@ impl App {
             pending_consent: None,
             last_deleted: None,
             show_shortcuts: false,
+            show_about: false,
             fill_params: None,
+            update_checker: UpdateChecker::new(),
         };
         app.reload();
         app
@@ -723,11 +728,12 @@ impl eframe::App for App {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Drain LLM results from worker threads.
+        // Drain LLM + update-check results from worker threads.
         let results = self.llm.poll();
         for r in results {
             self.handle_llm_result(r);
         }
+        self.update_checker.poll();
 
         // Inline-editor lifecycle: swap buffer when selection changes,
         // and debounced auto-save on changes.
@@ -750,6 +756,7 @@ impl eframe::App for App {
         self.draw_consent(ctx);
         self.draw_fill_params(ctx);
         self.draw_shortcuts(ctx);
+        self.draw_about(ctx);
         self.draw_toast(ctx);
 
         // expire toast
@@ -817,6 +824,7 @@ impl App {
             || self.confirm_delete.is_some()
             || self.show_import
             || self.show_shortcuts
+            || self.show_about
             || self.fill_params.is_some();
         if !modal_open {
             let (up, down, enter) = ctx.input(|i| {
@@ -870,6 +878,8 @@ impl App {
         if esc {
             if self.fill_params.is_some() {
                 self.fill_params = None;
+            } else if self.show_about {
+                self.show_about = false;
             } else if self.show_shortcuts {
                 self.show_shortcuts = false;
             } else if self.quick_add.is_some() {
@@ -899,7 +909,42 @@ impl App {
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                ui.label(RichText::new("📚 Spellbook").strong());
+                // Brand + version (click → About modal)
+                let title = RichText::new("📚 Spellbook").strong();
+                let ver = format!("v{}", self.update_checker.current_version());
+                let brand = ui
+                    .add(egui::Label::new(title).sense(egui::Sense::click()))
+                    .on_hover_text("点击查看版本 / 检查更新");
+                if brand.clicked() {
+                    self.show_about = true;
+                }
+                let ver_text = RichText::new(&ver).small().weak();
+                let ver_resp = ui
+                    .add(egui::Label::new(ver_text).sense(egui::Sense::click()))
+                    .on_hover_text("点击查看版本 / 检查更新");
+                if ver_resp.clicked() {
+                    self.show_about = true;
+                }
+                if self.update_checker.has_update() {
+                    let new_v = self
+                        .update_checker
+                        .update_info()
+                        .map(|i| i.latest_version.clone())
+                        .unwrap_or_default();
+                    let badge = ui
+                        .add(
+                            egui::Label::new(
+                                RichText::new(format!("↑ 新版 v{new_v}"))
+                                    .small()
+                                    .color(Color32::from_rgb(100, 200, 255)),
+                            )
+                            .sense(egui::Sense::click()),
+                        )
+                        .on_hover_text("点击查看");
+                    if badge.clicked() {
+                        self.show_about = true;
+                    }
+                }
                 if self.llm.in_flight() {
                     ui.label(RichText::new("🧠 AI 处理中").color(Color32::from_rgb(120, 180, 240)));
                 }
@@ -1925,6 +1970,166 @@ impl App {
         }
     }
 
+    // ---------- About / update ----------
+
+    fn draw_about(&mut self, ctx: &egui::Context) {
+        if !self.show_about {
+            return;
+        }
+        let mut open = true;
+        let mut do_check = false;
+        let mut copy_cli = false;
+        let mut copy_cask = false;
+        let mut open_release = false;
+
+        let current = self.update_checker.current_version().to_string();
+        let info = self.update_checker.update_info().cloned();
+        let has_update = self.update_checker.has_update();
+        let checking = self.update_checker.checking();
+        let last_check = self.update_checker.last_check();
+        let failed = self.update_checker.failed_reason().map(|s| s.to_string());
+
+        egui::Window::new("关于 Spellbook")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("📚 Spellbook").heading());
+                    ui.label(RichText::new(format!("v{current}")).weak());
+                });
+                ui.add_space(4.0);
+                ui.label(RichText::new("Your spellbook of shell incantations").weak());
+
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(6.0);
+
+                ui.label(RichText::new("更新").strong());
+                ui.add_space(2.0);
+                if checking {
+                    ui.label(
+                        RichText::new("正在检查最新版本…")
+                            .color(Color32::from_rgb(120, 180, 240)),
+                    );
+                } else if let Some(info) = &info {
+                    if has_update {
+                        ui.label(
+                            RichText::new(format!("✨ 新版可用：v{}", info.latest_version))
+                                .color(Color32::from_rgb(100, 200, 255))
+                                .strong(),
+                        );
+                        ui.add_space(6.0);
+                        ui.label(RichText::new("Homebrew 升级命令").small().weak());
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                TextEdit::singleline(&mut "brew upgrade spellbook".to_string())
+                                    .font(egui::TextStyle::Monospace)
+                                    .desired_width(220.0)
+                                    .interactive(false),
+                            );
+                            if ui.small_button("📋 复制").clicked() {
+                                copy_cli = true;
+                            }
+                            ui.label(RichText::new("CLI").weak().small());
+                        });
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                TextEdit::singleline(&mut "brew upgrade --cask spellbook".to_string())
+                                    .font(egui::TextStyle::Monospace)
+                                    .desired_width(220.0)
+                                    .interactive(false),
+                            );
+                            if ui.small_button("📋 复制").clicked() {
+                                copy_cask = true;
+                            }
+                            ui.label(RichText::new(".app").weak().small());
+                        });
+                        ui.add_space(6.0);
+                        if ui
+                            .button(RichText::new("🌐 打开 Release Notes"))
+                            .clicked()
+                        {
+                            open_release = true;
+                        }
+                    } else {
+                        ui.label(
+                            RichText::new(format!("✓ 已是最新版 (v{})", info.latest_version))
+                                .color(Color32::from_rgb(140, 200, 140)),
+                        );
+                    }
+                    if let Some(ts) = last_check {
+                        let age = chrono::Utc::now().signed_duration_since(ts);
+                        let txt = if age.num_minutes() < 1 {
+                            "刚刚检查".to_string()
+                        } else if age.num_hours() < 1 {
+                            format!("{} 分钟前检查", age.num_minutes())
+                        } else if age.num_days() < 1 {
+                            format!("{} 小时前检查", age.num_hours())
+                        } else {
+                            format!("{} 天前检查", age.num_days())
+                        };
+                        ui.label(RichText::new(txt).weak().small());
+                    }
+                } else if let Some(err) = failed {
+                    ui.label(
+                        RichText::new(format!("⚠ 检查失败: {err}"))
+                            .color(Color32::from_rgb(200, 140, 60)),
+                    );
+                } else {
+                    ui.label(RichText::new("尚未检查").weak());
+                }
+
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(!checking, egui::Button::new("🔄 立即检查"))
+                        .clicked()
+                    {
+                        do_check = true;
+                    }
+                    ui.hyperlink_to(
+                        "GitHub 仓库",
+                        "https://github.com/bkcarlos/spellbook",
+                    );
+                });
+
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add_space(4.0);
+                ui.label(RichText::new("数据位置").strong());
+                if let Ok(dir) = crate::db::data_dir() {
+                    ui.label(
+                        RichText::new(dir.display().to_string())
+                            .monospace()
+                            .small()
+                            .weak(),
+                    );
+                }
+            });
+
+        if do_check {
+            self.update_checker.kick_off_check();
+        }
+        if copy_cli {
+            self.copy_to_clipboard("brew upgrade spellbook");
+        }
+        if copy_cask {
+            self.copy_to_clipboard("brew upgrade --cask spellbook");
+        }
+        if open_release {
+            if let Some(info) = &info {
+                if let Err(e) = open_url(&info.release_url) {
+                    self.toast_error(format!("无法打开浏览器: {e}"));
+                }
+            }
+        }
+        if !open {
+            self.show_about = false;
+        }
+    }
+
     // ---------- shortcut help ----------
 
     fn draw_shortcuts(&mut self, ctx: &egui::Context) {
@@ -2645,6 +2850,17 @@ pub fn substitute_variables(template: &str, vars: &[(String, String)]) -> String
         s = s.replace(&needle, value);
     }
     s
+}
+
+fn open_url(url: &str) -> std::io::Result<()> {
+    let cmd = if cfg!(target_os = "macos") {
+        "open"
+    } else if cfg!(target_os = "windows") {
+        "explorer"
+    } else {
+        "xdg-open"
+    };
+    std::process::Command::new(cmd).arg(url).spawn().map(|_| ())
 }
 
 fn first_line(s: &str, max: usize) -> String {

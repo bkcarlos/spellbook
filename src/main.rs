@@ -6,6 +6,7 @@ mod inference;
 mod llm;
 mod models;
 mod search;
+mod update;
 
 use eframe::egui;
 

@@ -1,6 +1,6 @@
 [package]
 name = "spellbook"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "Your personal spellbook of shell incantations — local-first command vault with fuzzy search, parameter templates, and optional AI."
 license = "MIT"

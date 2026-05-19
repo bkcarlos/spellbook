@@ -39,6 +39,16 @@ open -a Spellbook
 
 Then run `spellbook` from a terminal.
 
+### Windows
+
+Download `spellbook-x86_64-pc-windows-msvc.zip` from the
+[latest release](https://github.com/bkcarlos/spellbook/releases/latest),
+unzip, and run `spellbook.exe`. No installer — the .exe is self-contained.
+
+Optional: move the .exe to a folder on your `PATH` so you can launch it from
+the Run dialog (`Win + R`), or pin it to the Start Menu / Taskbar by right-
+clicking the .exe in Explorer.
+
 ### macOS .app bundle (drag-to-Applications, Dock-friendly)
 
 ```bash

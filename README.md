@@ -13,6 +13,7 @@ A small, fast desktop app (Rust + egui) for anyone who lives in a terminal — d
 - **One-click copy** — `Cmd+Shift+C` from anywhere; Enter on the list.
 - **Parameter templates** — write `ssh ${USER}@${HOST}`, get a fill-in dialog before copy.
 - **Inline editor** — select a command, edit on the right side. Auto-saves 500ms after you stop typing.
+- **Markdown description with per-block copy** — every fenced code block in a command's description gets its own 📋 button, so multi-step workflows live in one note without forcing copy-paste gymnastics.
 - **Recycle bin** — soft delete with 7-day undo window.
 - **AI (optional)** — paste-to-enhance, AI explain, natural-language → command, etc. Off by default; configured in Settings.
 
@@ -92,6 +93,7 @@ Press `?` (or `F1`) inside the app to see them all.
 |---|---|
 | `Cmd/Ctrl + N` | New command (auto-pastes clipboard) |
 | `Cmd/Ctrl + K` | Focus search |
+| `Cmd/Ctrl + F` | Find within the selected command's description (`Enter` / `Shift+Enter` to step) |
 | `Cmd/Ctrl + Shift + C` | Copy selected command |
 | `Cmd/Ctrl + D` | Toggle favorite |
 | `Cmd/Ctrl + E` | Focus title for renaming |
@@ -120,6 +122,11 @@ sent before the first call. The app never overwrites a field you've manually
 edited. API keys are read from the env var first, then the OS keychain — never
 written to the config file.
 
+Every AI trigger (paste-enhance, describe, generate, explain) has a 👁 button
+that opens **"本次将发送给 AI 的内容"** — the full request body, exactly as it
+will hit the wire, with your API key replaced by a placeholder naming the env
+var or Keychain entry it would have come from. Inspect first, send second.
+
 Data lives in:
 
 - **macOS** `~/Library/Application Support/Spellbook/`
@@ -145,7 +152,7 @@ Spellbook checks GitHub for new releases on startup (result cached 24h).
 ## Development
 
 ```bash
-cargo test                    # unit tests (83+)
+cargo test                    # unit tests (110+)
 cargo run                     # debug build
 cargo build --release         # 12MB native binary
 ```

@@ -1206,6 +1206,11 @@ impl App {
             });
     }
 
+    /// Sidebar row for the fixed views (All / Favorites / Recent / Trash).
+    /// Category rows are drawn inline inside `draw_sidebar` because they need
+    /// drag-and-drop reorder and a context menu, both of which require a
+    /// single `Sense::click_and_drag()` interact layer rather than a plain
+    /// selectable_label (see the long comment in the category loop).
     fn sidebar_entry(&mut self, ui: &mut Ui, view: View, label: &str, count: usize) {
         let selected = self.selected_view == view;
         let text = format!("{}  ({})", label, count);
@@ -1214,26 +1219,6 @@ impl App {
             self.selected_view = view;
             self.selected_command_id = None;
         }
-        resp.context_menu(|ui| {
-            if let View::Category(cid) = view {
-                let cat_id = cid;
-                if ui.button("重命名").clicked() {
-                    if let Some(c) = self.categories.iter().find(|c| c.id == cat_id) {
-                        self.new_category_name = c.name.clone();
-                        self.show_new_category = true;
-                    }
-                    ui.close_menu();
-                }
-                if ui.button(RichText::new("🗑 删除").color(Color32::from_rgb(200, 80, 80))).clicked() {
-                    let _ = self.db.delete_category(cat_id);
-                    self.reload();
-                    if self.selected_view == View::Category(cat_id) {
-                        self.selected_view = View::All;
-                    }
-                    ui.close_menu();
-                }
-            }
-        });
     }
 
     // ---------- detail (right) ----------

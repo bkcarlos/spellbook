@@ -1099,10 +1099,79 @@ impl App {
                         let frame = egui::Frame::none()
                             .inner_margin(egui::Margin::symmetric(0.0, 1.0));
                         let drag_id = egui::Id::new(("cat_drag", cat.id));
+                        let cat_id = cat.id;
+                        let view = View::Category(cat_id);
+                        let label_text = format!("{}  ({})", cat.name, count);
                         let (inner, payload) =
                             ui.dnd_drop_zone::<i64, _>(frame, |ui| {
-                                ui.dnd_drag_source(drag_id, cat.id, |ui| {
-                                    self.sidebar_entry(ui, View::Category(cat.id), &cat.name, count);
+                                // Render the row. While being dragged, paint it on a
+                                // top layer that follows the cursor — same visual as
+                                // egui's dnd_drag_source does for in-flight drags.
+                                let selected = self.selected_view == view;
+                                let is_dragged = ui.ctx().is_being_dragged(drag_id);
+                                let label_resp = if is_dragged {
+                                    egui::DragAndDrop::set_payload(ui.ctx(), cat_id);
+                                    let layer = egui::LayerId::new(egui::Order::Tooltip, drag_id);
+                                    let r = ui.with_layer_id(layer, |ui| {
+                                        ui.add(egui::SelectableLabel::new(
+                                            selected,
+                                            label_text.clone(),
+                                        ))
+                                    });
+                                    if let Some(p) = ui.ctx().pointer_interact_pos() {
+                                        let delta = p - r.response.rect.center();
+                                        ui.ctx().transform_layer_shapes(
+                                            layer,
+                                            egui::emath::TSTransform::from_translation(delta),
+                                        );
+                                    }
+                                    r.inner
+                                } else {
+                                    ui.add(egui::SelectableLabel::new(selected, label_text.clone()))
+                                };
+
+                                // One interaction layer that senses BOTH click and
+                                // drag. The previous code used dnd_drag_source, which
+                                // installs a drag-only interact above the label;
+                                // egui's hit-test rule "drag-on-top suppresses the
+                                // click behind it" (egui 0.29 hit_test.rs:299-307)
+                                // then silently dropped every click on the category
+                                // row, so selecting a category did nothing.
+                                let dnd = ui
+                                    .interact(
+                                        label_resp.rect,
+                                        drag_id,
+                                        egui::Sense::click_and_drag(),
+                                    )
+                                    .on_hover_cursor(egui::CursorIcon::Grab);
+                                if dnd.clicked() {
+                                    self.selected_view = view;
+                                    self.selected_command_id = None;
+                                }
+                                dnd.context_menu(|ui| {
+                                    if ui.button("重命名").clicked() {
+                                        if let Some(c) =
+                                            self.categories.iter().find(|c| c.id == cat_id)
+                                        {
+                                            self.new_category_name = c.name.clone();
+                                            self.show_new_category = true;
+                                        }
+                                        ui.close_menu();
+                                    }
+                                    if ui
+                                        .button(
+                                            RichText::new("🗑 删除")
+                                                .color(Color32::from_rgb(200, 80, 80)),
+                                        )
+                                        .clicked()
+                                    {
+                                        let _ = self.db.delete_category(cat_id);
+                                        self.reload();
+                                        if self.selected_view == View::Category(cat_id) {
+                                            self.selected_view = View::All;
+                                        }
+                                        ui.close_menu();
+                                    }
                                 });
                             });
                         if let Some(dropped_arc) = payload {

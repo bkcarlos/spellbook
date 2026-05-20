@@ -2,7 +2,7 @@
 
 > 一个专门给开发者记录和快速查找常用命令的本地桌面软件。
 >
-> 维护：2026-05-18 · 状态：草案
+> 维护：2026-05-20 · 状态：草案
 
 ---
 
@@ -650,7 +650,7 @@ ssh-keygen        → keygen
 │ 不会发送：                                               │
 │   • 你的其他命令                                         │
 │   • 任何个人信息                                         │
-│   • API key（始终只从环境变量读）                        │
+│   • API key（从环境变量或系统 Keychain 读，不写配置文件）│
 │                                                         │
 │ 可随时在设置中关闭。                                     │
 │                                                         │
@@ -760,7 +760,7 @@ LLM 把它翻译成关键词（如 `port lsof netstat 8080`），再走本地模
 type = "openai"          # openai | anthropic | ollama | custom
 base_url = "https://api.openai.com/v1"
 model = "gpt-4o-mini"
-api_key_env = "OPENAI_API_KEY"   # 从环境变量读，不存配置
+api_key_env = "OPENAI_API_KEY"   # 环境变量名；密钥本身不存配置文件
 
 [limits]
 max_tokens = 512
@@ -773,7 +773,13 @@ explain = true
 nl_search = false
 ```
 
-> API key **只通过环境变量读取**，不写入配置文件，避免泄漏到备份/同步盘。
+> API key **绝不写入 `llm.toml`**。两条读取路径：
+>
+> 1. 环境变量（`api_key_env` 指定名字，如 `OPENAI_API_KEY`）—— 优先
+> 2. 系统 Keychain（用户在设置里点"保存到 Keychain"主动写入）—— 兜底
+>
+> 后者通过 `keyring` crate 接入 macOS Keychain / Windows Credential Manager /
+> Linux Secret Service，密钥从不在明文磁盘文件里出现，避免泄漏到备份/同步盘。
 
 ### 8.5 隐私
 
@@ -840,7 +846,13 @@ nl_search = false
 - 智能补全描述
 - 命令翻译
 - 错误诊断
-- 命令变量 / 参数模板（`ssh user@${HOST}`）
+
+### 已落地（不在初版路线图但已在 0.1.x 中实装）
+
+- 命令变量 / 参数模板（`ssh ${USER}@${HOST}` → 复制前弹填空对话框）
+- 回收站 / 7 天软删除（`command_note.deleted_at` 列 + Trash 视图）
+- API key 写入系统 Keychain（v0.1.6）
+- 应用内一键自更新（仅 macOS `.app`，v0.1.8）
 
 ---
 
@@ -851,7 +863,7 @@ nl_search = false
 | egui 在三端的字体渲染一致性 | 提前在 W1 验证 macOS / Windows / Linux 中文字体 |
 | 1w+ 命令下搜索性能 | W2 用 mock 数据压测；如内存策略不够，再上 FTS5 |
 | LLM 输出不稳定（标签格式不一致） | 加 schema 校验 + 重试一次，失败则丢弃 |
-| API key 管理 | 仅走环境变量；不提供 GUI 输入框，避免明文落盘 |
+| API key 管理 | 环境变量优先 + 系统 Keychain 兜底；密钥从不写 `llm.toml` |
 | "本地优先" vs "AI 联网" 的产品张力 | 默认全部 AI 功能关闭，用户主动开启 |
 | 命令执行的安全风险 | 永远不在软件内执行命令，仅复制到剪贴板 |
 | 自动打标签的"噪音" | 用候选 chips、不自动写入；用户拒绝行为不上传 |
@@ -865,3 +877,4 @@ nl_search = false
 | 2026-05-18 | v1.0 | 初版整理；新增第 7 节自动打标签、第 8 节 AI/LLM 可选功能 |
 | 2026-05-18 | v1.1 | 新增"极速新增（粘贴即存）"为命令新建主流程；第 7 节扩展为标题/分类/标签统一推断 |
 | 2026-05-18 | v1.2 | 第 7.3 节重构为"AI 后台增强（粘贴即增强）"，覆盖触发门禁、覆盖策略、保存时机、首次同意流程；§8 原则更新为"默认手动，自动需明示同意" |
+| 2026-05-20 | v1.3 | §8.4 / §11 / §7.3.7：API key 管理新增系统 Keychain 兜底路径（v0.1.6）；路线图新增"已落地"小节，记录参数模板、回收站、Keychain、应用内自更新（v0.1.8）等已实装但未在初版规划中的能力 |

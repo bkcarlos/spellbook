@@ -109,13 +109,16 @@ All AI features are off by default. To enable:
 
 1. Open **设置** (top bar).
 2. Pick a provider: OpenAI-compatible (covers OpenAI, DeepSeek, Ollama-with-/v1) or Anthropic.
-3. Set the env var holding your API key (e.g. `export OPENAI_API_KEY=sk-...`).
+3. Supply your API key one of two ways:
+   - Set the env var named in Settings (e.g. `export OPENAI_API_KEY=sk-...`), **or**
+   - Paste it into Settings and click **Save to Keychain** — stored in the OS
+     keychain (macOS Keychain / Windows Credential Manager / libsecret on Linux).
 4. Toggle the features you want.
 
 The "paste-to-enhance" feature shows a one-time consent dialog explaining what's
 sent before the first call. The app never overwrites a field you've manually
-edited. API keys are read from environment variables only — never written to
-the config file.
+edited. API keys are read from the env var first, then the OS keychain — never
+written to the config file.
 
 Data lives in:
 
@@ -125,10 +128,24 @@ Data lives in:
 
 ---
 
+## Updates
+
+Spellbook checks GitHub for new releases on startup (result cached 24h).
+
+- **macOS `.app` install** — when a newer version is available, the About dialog
+  shows a one-click **Update now** button. It downloads the signed `.dmg`,
+  swaps `/Applications/Spellbook.app`, strips quarantine, and offers a restart.
+  No `brew`/`curl` needed.
+- **All other install paths** (Homebrew CLI, raw `cargo install`, Windows `.exe`,
+  Linux tarball) — the dialog links to the GitHub release page; upgrades go
+  through your usual channel (`brew upgrade spellbook`, re-download, etc).
+
+---
+
 ## Development
 
 ```bash
-cargo test                    # unit tests (78+)
+cargo test                    # unit tests (83+)
 cargo run                     # debug build
 cargo build --release         # 12MB native binary
 ```
@@ -143,6 +160,8 @@ src/
 ├── inference.rs   # rule-based title/category/tag inference
 ├── search.rs      # fuzzy-matcher integration
 ├── llm.rs         # LLM client + manager (OpenAI / Anthropic)
+├── installer.rs   # macOS .app one-click self-update (DMG)
+├── update.rs      # GitHub release version check
 └── models.rs      # domain types
 docs/PRD.md        # full product requirements
 assets/            # bundled fonts (NotoEmoji, OFL license)

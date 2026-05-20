@@ -1,14 +1,16 @@
 # Release process
 
-## TL;DR — releasing v0.2.0
+## TL;DR — cutting the next release
+
+Replace `OLD` / `NEW` with the actual versions (e.g. `0.1.8` → `0.1.9`):
 
 ```bash
 # 1. bump version
-sed -i '' 's/^version = "0.1.0"/version = "0.2.0"/' Cargo.toml
-git commit -am "Release v0.2.0"
+sed -i '' 's/^version = "OLD"/version = "NEW"/' Cargo.toml
+git commit -am "Release vNEW"
 
 # 2. tag + push — CI does everything else
-git tag v0.2.0
+git tag vNEW
 git push origin main --tags
 ```
 
@@ -28,7 +30,7 @@ brew install spellbook              # CLI: binary in /opt/homebrew/bin/
 brew install --cask spellbook       # GUI: Spellbook.app in /Applications/
 ```
 
-Both reach the same v0.1.0 binary internally; the cask just wraps it in a
+Both reach the same Spellbook binary internally; the cask just wraps it in a
 proper .app bundle so it shows in Dock / Spotlight / Launchpad.
 
 ## One-time setup (already done if you're reading this)

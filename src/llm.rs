@@ -57,7 +57,12 @@ impl Default for LlmConfig {
             base_url: "https://api.openai.com/v1".to_string(),
             model: "gpt-4o-mini".to_string(),
             api_key_env: "OPENAI_API_KEY".to_string(),
-            timeout_secs: 12,
+            // 60s is realistic for chat completions with max_tokens=800 across
+            // OpenAI / Anthropic / DeepSeek / Ollama. The previous default of 12s
+            // produced "请求超时" toasts on virtually every real call — ureq's
+            // .timeout() is a whole-request deadline, not a per-op deadline.
+            // Reasoning models (o1/o3) still need to be raised in Settings.
+            timeout_secs: 60,
             max_tokens: 800,
             offline_mode: false,
             rate_per_minute: 30,
@@ -193,6 +198,56 @@ fn anthropic_body(config: &LlmConfig, system: &str, user: &str) -> serde_json::V
     })
 }
 
+/// Translate a `ureq::Error` (which has terse, English, often confusing messages)
+/// into a Chinese-language error that includes elapsed wall-clock time and a
+/// pointer at the relevant Settings field. Critically, when the elapsed time
+/// is within ~10% of the configured `timeout_secs`, we mark the error as a
+/// timeout-from-our-own-deadline and tell the user to raise it.
+fn format_http_error(e: ureq::Error, elapsed: Duration, timeout_secs: u64) -> anyhow::Error {
+    let secs = elapsed.as_secs_f64();
+    let near_deadline = timeout_secs > 0 && secs >= timeout_secs as f64 * 0.9;
+    match e {
+        ureq::Error::Status(status, response) => {
+            let url = response.get_url().to_string();
+            let body = response.into_string().unwrap_or_default();
+            let snippet: String = body.chars().take(300).collect();
+            anyhow!(
+                "HTTP {status}（{:.1}s, {url}）: {snippet}",
+                secs,
+                url = url,
+                snippet = snippet
+            )
+        }
+        ureq::Error::Transport(t) => {
+            let kind = t.kind();
+            let host = t
+                .url()
+                .and_then(|u| u.host_str())
+                .unwrap_or("远端")
+                .to_string();
+            if kind == ureq::ErrorKind::Io && near_deadline {
+                anyhow!(
+                    "请求超时（{:.1}s / 上限 {}s）。可在「设置 → 超时（秒）」调高，或检查到 {} 的网络。",
+                    secs,
+                    timeout_secs,
+                    host
+                )
+            } else if kind == ureq::ErrorKind::Dns {
+                anyhow!("DNS 解析失败（{:.1}s）: 检查 base_url 是否正确：{}", secs, t)
+            } else if kind == ureq::ErrorKind::ConnectionFailed {
+                anyhow!(
+                    "无法连接到 {}（{:.1}s）: 检查 base_url 和网络。原始错误：{}",
+                    host,
+                    secs,
+                    t
+                )
+            } else {
+                anyhow!("网络错误（{:.1}s）: {}", secs, t)
+            }
+        }
+    }
+}
+
 fn complete_openai(config: &LlmConfig, api_key: &str, system: &str, user: &str) -> Result<String> {
     let url = openai_url(config);
     let body = openai_body(config, system, user);
@@ -203,9 +258,11 @@ fn complete_openai(config: &LlmConfig, api_key: &str, system: &str, user: &str) 
     if !api_key.is_empty() {
         req = req.set("Authorization", &format!("Bearer {api_key}"));
     }
-    let resp = req
-        .send_json(body)
-        .map_err(|e| anyhow!("http error: {e}"))?;
+    let start = Instant::now();
+    let resp = match req.send_json(body) {
+        Ok(r) => r,
+        Err(e) => return Err(format_http_error(e, start.elapsed(), config.timeout_secs)),
+    };
     let json: serde_json::Value = resp.into_json().context("parse json")?;
     let text = json
         .get("choices")
@@ -214,6 +271,11 @@ fn complete_openai(config: &LlmConfig, api_key: &str, system: &str, user: &str) 
         .and_then(|v| v.get("content"))
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("unexpected response shape"))?;
+    log::debug!(
+        "openai call ok in {:.1}s ({} chars)",
+        start.elapsed().as_secs_f64(),
+        text.len()
+    );
     Ok(text.to_string())
 }
 
@@ -228,13 +290,17 @@ fn complete_anthropic(
     let agent = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(config.timeout_secs))
         .build();
-    let resp = agent
+    let start = Instant::now();
+    let resp = match agent
         .post(&url)
         .set("x-api-key", api_key)
         .set("anthropic-version", "2023-06-01")
         .set("Content-Type", "application/json")
         .send_json(body)
-        .map_err(|e| anyhow!("http error: {e}"))?;
+    {
+        Ok(r) => r,
+        Err(e) => return Err(format_http_error(e, start.elapsed(), config.timeout_secs)),
+    };
     let json: serde_json::Value = resp.into_json().context("parse json")?;
     let text = json
         .get("content")
@@ -242,6 +308,11 @@ fn complete_anthropic(
         .and_then(|v| v.get("text"))
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("unexpected response shape"))?;
+    log::debug!(
+        "anthropic call ok in {:.1}s ({} chars)",
+        start.elapsed().as_secs_f64(),
+        text.len()
+    );
     Ok(text.to_string())
 }
 
@@ -847,6 +918,62 @@ fn parse_generate(s: &str) -> Result<GenerateResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Bind a TCP listener that accepts but never writes a response. Used to
+    /// trigger a deterministic ureq read-timeout against localhost so the test
+    /// has no network dependency and runs in ~1s.
+    fn slow_localhost_endpoint() -> std::net::SocketAddr {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                // Accept the connection but hold it open and never write.
+                // The Vec keeps the streams alive long enough to outlast the
+                // client-side timeout we're testing.
+                let _keep = stream;
+                std::thread::sleep(Duration::from_secs(5));
+            }
+        });
+        addr
+    }
+
+    #[test]
+    fn timeout_error_surfaces_elapsed_and_setting_hint() {
+        let addr = slow_localhost_endpoint();
+        let mut config = LlmConfig::default();
+        config.provider = Provider::OpenAi;
+        config.base_url = format!("http://{}/v1", addr);
+        config.timeout_secs = 1; // force a fast deadline for the test
+
+        let start = Instant::now();
+        let r = complete_openai(&config, "test-key", "sys", "user");
+        let elapsed = start.elapsed();
+        assert!(r.is_err(), "expected timeout, got Ok");
+        let msg = format!("{}", r.unwrap_err());
+        assert!(msg.contains("请求超时"), "want 请求超时 hint, got: {msg}");
+        assert!(msg.contains("上限 1s"), "want '上限 1s', got: {msg}");
+        assert!(
+            elapsed >= Duration::from_secs(1) && elapsed < Duration::from_secs(4),
+            "should hit the 1s deadline quickly; got {:?}",
+            elapsed
+        );
+    }
+
+    #[test]
+    fn anthropic_timeout_error_uses_same_format() {
+        let addr = slow_localhost_endpoint();
+        let mut config = LlmConfig::default();
+        config.provider = Provider::Anthropic;
+        config.base_url = format!("http://{}", addr);
+        config.timeout_secs = 1;
+
+        let r = complete_anthropic(&config, "test-key", "sys", "user");
+        assert!(r.is_err());
+        let msg = format!("{}", r.unwrap_err());
+        assert!(msg.contains("请求超时"), "got: {msg}");
+        assert!(msg.contains("/ 上限 1s"), "got: {msg}");
+    }
 
     #[test]
     fn parses_clean_enhance_json() {

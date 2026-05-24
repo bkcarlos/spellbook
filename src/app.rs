@@ -3254,7 +3254,12 @@ impl App {
                         ui.end_row();
 
                         ui.label("超时（秒）");
-                        ui.add(egui::DragValue::new(&mut draft.timeout_secs).range(3..=60));
+                        ui.add(egui::DragValue::new(&mut draft.timeout_secs).range(5..=300))
+                            .on_hover_text(
+                                "整次请求的总超时（含 DNS+连接+响应）。\n\
+                                 大多数 chat-completion 调用 5-30s；\n\
+                                 reasoning 模型（o1/o3）需要 60-180s。",
+                            );
                         ui.end_row();
 
                         ui.label("Max tokens");
